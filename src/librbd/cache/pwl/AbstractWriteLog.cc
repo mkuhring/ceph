@@ -259,7 +259,7 @@ void AbstractWriteLog<I>::perf_start(std::string name) {
 
   plb.add_u64_counter(l_librbd_pwl_cmp, "cmp", "Compare and Write requests");
   plb.add_u64_counter(l_librbd_pwl_cmp_bytes, "cmp_bytes", "Compare and Write bytes compared/written");
-  plb.add_time_avg(l_librbd_pwl_cmp_latency, "cmp_lat", "Compare and Write latecy");
+  plb.add_time_avg(l_librbd_pwl_cmp_latency, "cmp_lat", "Compare and Write latency");
   plb.add_u64_counter(l_librbd_pwl_cmp_fails, "cmp_fails", "Compare and Write compare fails");
 
   plb.add_u64_counter(l_librbd_pwl_internal_flush, "internal_flush", "Flush RWL (write back to OSD)");
@@ -301,7 +301,8 @@ void AbstractWriteLog<I>::log_perf() {
   ss << "\"image\": \"" << m_image_ctx.name << "\",";
   bl.append(ss);
   bl.append("\"stats\": ");
-  m_image_ctx.cct->get_perfcounters_collection()->dump_formatted(f, 0);
+  m_image_ctx.cct->get_perfcounters_collection()->dump_formatted(
+      f, false, select_labeled_t::unlabeled);
   f->flush(bl);
   bl.append(",\n\"histograms\": ");
   m_image_ctx.cct->get_perfcounters_collection()->dump_formatted_histograms(f, 0);
@@ -517,7 +518,7 @@ void AbstractWriteLog<I>::pwl_init(Context *on_finish, DeferredContexts &later) 
   if ((!m_cache_state->present) &&
       (access(m_log_pool_name.c_str(), F_OK) == 0)) {
     ldout(cct, 5) << "There's an existing pool file " << m_log_pool_name
-                  << ", While there's no cache in the image metatata." << dendl;
+                  << ", While there's no cache in the image metadata." << dendl;
     if (remove(m_log_pool_name.c_str()) != 0) {
       lderr(cct) << "failed to remove the pool file " << m_log_pool_name
                  << dendl;
@@ -1307,7 +1308,6 @@ void AbstractWriteLog<I>::complete_op_log_entries(GenericLogOperations &&ops,
 {
   GenericLogEntries dirty_entries;
   int published_reserves = 0;
-  bool need_update_state = false;
   ldout(m_image_ctx.cct, 20) << __func__ << ": completing" << dendl;
   for (auto &op : ops) {
     utime_t now = ceph_clock_now();
@@ -1327,11 +1327,6 @@ void AbstractWriteLog<I>::complete_op_log_entries(GenericLogOperations &&ops,
       std::lock_guard locker(m_lock);
       m_unpublished_reserves -= published_reserves;
       m_dirty_log_entries.splice(m_dirty_log_entries.end(), dirty_entries);
-      if (m_cache_state->clean && !this->m_dirty_log_entries.empty()) {
-        m_cache_state->clean = false;
-        update_image_cache_state();
-        need_update_state = true;
-      }
     }
     op->complete(result);
     m_perfcounter->tinc(l_librbd_pwl_log_op_dis_to_app_t,
@@ -1345,10 +1340,6 @@ void AbstractWriteLog<I>::complete_op_log_entries(GenericLogOperations &&ops,
     m_perfcounter->hinc(l_librbd_pwl_log_op_app_to_appc_t_hist, app_lat.to_nsec(),
                       log_entry->ram_entry.write_bytes);
     m_perfcounter->tinc(l_librbd_pwl_log_op_app_to_cmp_t, now - op->log_append_start_time);
-  }
-  if (need_update_state) {
-    std::unique_lock locker(m_lock);
-    write_image_cache_state(locker);
   }
   // New entries may be flushable
   {
@@ -1539,7 +1530,7 @@ bool AbstractWriteLog<I>::check_allocation(
   }
 
   if (alloc_succeeds) {
-    std::lock_guard locker(m_lock);
+    std::unique_lock locker(m_lock);
     /* We need one free log entry per extent (each is a separate entry), and
      * one free "lane" for remote replication. */
     if ((m_free_lanes >= num_lanes) &&
@@ -1551,6 +1542,11 @@ bool AbstractWriteLog<I>::check_allocation(
       m_bytes_allocated += bytes_allocated;
       m_bytes_cached += bytes_cached;
       m_bytes_dirty += bytes_dirtied;
+      if (m_cache_state->clean && bytes_dirtied > 0) {
+        m_cache_state->clean = false;
+        update_image_cache_state();
+        write_image_cache_state(locker);
+      }
     } else {
       alloc_succeeds = false;
     }
@@ -1757,7 +1753,7 @@ void AbstractWriteLog<I>::process_writeback_dirty_entries() {
     std::lock_guard locker(m_lock);
     while (flushed < IN_FLIGHT_FLUSH_WRITE_LIMIT) {
       if (m_shutting_down) {
-        ldout(cct, 5) << "Flush during shutdown supressed" << dendl;
+        ldout(cct, 5) << "Flush during shutdown suppressed" << dendl;
         /* Do flush complete only when all flush ops are finished */
         all_clean = !m_flush_ops_in_flight;
         break;

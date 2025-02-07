@@ -14,23 +14,28 @@
 
 namespace crimson::osd {
   class ShardServices;
+  class PG;
 }
 
 class ReplicatedBackend : public PGBackend
 {
 public:
   ReplicatedBackend(pg_t pgid, pg_shard_t whoami,
+		    crimson::osd::PG& pg,
 		    CollectionRef coll,
-		    crimson::osd::ShardServices& shard_services);
+		    crimson::osd::ShardServices& shard_services,
+		    DoutPrefixProvider &dpp);
   void got_rep_op_reply(const MOSDRepOpReply& reply) final;
   seastar::future<> stop() final;
-  void on_actingset_changed(peering_info_t pi) final;
+  void on_actingset_changed(bool same_primary) final;
 private:
   ll_read_ierrorator::future<ceph::bufferlist>
     _read(const hobject_t& hoid, uint64_t off,
 	  uint64_t len, uint32_t flags) override;
-  rep_op_fut_t _submit_transaction(std::set<pg_shard_t>&& pg_shards,
+  rep_op_fut_t submit_transaction(
+    const std::set<pg_shard_t> &pg_shards,
     const hobject_t& hoid,
+    crimson::osd::ObjectContextRef&& new_clone,
     ceph::os::Transaction&& txn,
     osd_op_params_t&& osd_op_p,
     epoch_t min_epoch, epoch_t max_epoch,
@@ -54,6 +59,18 @@ private:
   };
   using pending_transactions_t = std::map<ceph_tid_t, pending_on_t>;
   pending_transactions_t pending_trans;
+  crimson::osd::PG& pg;
+
+  MURef<MOSDRepOp> new_repop_msg(
+    const pg_shard_t &pg_shard,
+    const hobject_t &hoid,
+    const bufferlist &encoded_txn,
+    const osd_op_params_t &osd_op_p,
+    epoch_t min_epoch,
+    epoch_t map_epoch,
+    const std::vector<pg_log_entry_t> &log_entries,
+    bool send_op,
+    ceph_tid_t tid);
 
   seastar::future<> request_committed(
     const osd_reqid_t& reqid, const eversion_t& at_version) final;

@@ -76,8 +76,8 @@ protected:
   /// Basic interface to a work queue used by the worker threads.
   struct WorkQueue_ {
     std::string name;
-    ceph::timespan timeout_interval;
-    ceph::timespan suicide_interval;
+    std::atomic<ceph::timespan> timeout_interval = ceph::timespan::zero();
+    std::atomic<ceph::timespan> suicide_interval = ceph::timespan::zero();
     WorkQueue_(std::string n, ceph::timespan ti, ceph::timespan sti)
       : name(std::move(n)), timeout_interval(ti), suicide_interval(sti)
     { }
@@ -98,21 +98,25 @@ protected:
      * It can be used for non-thread-safe finalization. */
     virtual void _void_process_finish(void *) = 0;
     void set_timeout(time_t ti){
-      timeout_interval = ceph::make_timespan(ti);
+      timeout_interval.store(ceph::make_timespan(ti));
     }
     void set_suicide_timeout(time_t sti){
-      suicide_interval = ceph::make_timespan(sti);
+      suicide_interval.store(ceph::make_timespan(sti));
     }
   };
 
   // track thread pool size changes
   unsigned _num_threads;
   std::string _thread_num_option;
-  const char **_conf_keys;
 
-  const char **get_tracked_conf_keys() const override {
-    return _conf_keys;
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    if (_thread_num_option.empty()) {
+      return {};
+    } else {
+      return {_thread_num_option};
+    }
   }
+
   void handle_conf_change(const ConfigProxy& conf,
 			  const std::set <std::string> &changed) override;
 
@@ -589,7 +593,8 @@ public:
   class BaseShardedWQ {
   
   public:
-    ceph::timespan timeout_interval, suicide_interval;
+    std::atomic<ceph::timespan> timeout_interval = ceph::timespan::zero();
+    std::atomic<ceph::timespan> suicide_interval = ceph::timespan::zero();
     BaseShardedWQ(ceph::timespan ti, ceph::timespan sti)
       :timeout_interval(ti), suicide_interval(sti) {}
     virtual ~BaseShardedWQ() {}
@@ -598,6 +603,12 @@ public:
     virtual void return_waiting_threads() = 0;
     virtual void stop_return_waiting_threads() = 0;
     virtual bool is_shard_empty(uint32_t thread_index) = 0;
+    void set_timeout(time_t ti) {
+      timeout_interval.store(ceph::make_timespan(ti));
+    }
+    void set_suicide_timeout(time_t sti) {
+      suicide_interval.store(ceph::make_timespan(sti));
+    }
   };
 
   template <typename T>

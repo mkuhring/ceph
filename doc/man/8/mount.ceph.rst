@@ -22,6 +22,9 @@ the real work. To mount a Ceph file system use::
 
   mount.ceph name@07fe3187-00d9-42a3-814b-72a4d5e7d5be.fs_name=/ /mnt/mycephfs -o mon_addr=1.2.3.4
 
+where "name" is the RADOS client name (referred to hereafter as "RADOS user",
+and meaning any individual or system actor such as an application). 
+
 Mount helper can fill in the cluster FSID by reading the ceph configuration file.
 Its recommended to call the mount helper via mount(8) as per::
 
@@ -53,7 +56,7 @@ A sub-directory of the file system can be mounted by specifying the (absolute)
 path to the sub-directory right after "=" in the device part of the mount command.
 
 Mount helper application conventions dictate that the first two options are
-device to be mounted and the mountpoint for that device. Options must be
+device to be mounted and the mount point for that device. Options must be
 passed only after these fixed arguments.
 
 
@@ -112,6 +115,12 @@ Basic
       After reconnect, file locks become stale because the MDS loses track of
       them. If an inode contains any stale file locks, read/write on the inode
       is not allowed until applications release all stale file locks.
+
+:command: `fs=<fs-name>`
+    Specify the non-default file system to be mounted, when using the old syntax.
+
+:command: `mds_namespace=<fs-name>`
+    A synonym of "fs=" (Deprecated).
 
 Advanced
 --------
@@ -183,12 +192,57 @@ Advanced
 :command:`wsync`
     Execute all namespace operations synchronously. This ensures that the
     namespace operation will only complete after receiving a reply from
-    the MDS. This is the default.
+    the MDS. 
 
 :command:`nowsync`
     Allow the client to do namespace operations asynchronously. When this
     option is enabled, a namespace operation may complete before the MDS
-    replies, if it has sufficient capabilities to do so.
+    replies, if it has sufficient capabilities to do so. This has been the
+    default since kernel version 5.16.
+
+:command:`crush_location=x`
+    Specify the location of the client in terms of CRUSH hierarchy (since 5.8).
+    This is a set of key-value pairs separated from each other by '|', with
+    keys separated from values by ':'.  Note that '|' may need to be quoted
+    or escaped to avoid it being interpreted as a pipe by the shell. The key
+    is the bucket type name (e.g. rack, datacenter or region with default
+    bucket types) and the value is the bucket name. For example, to indicate
+    that the client is local to rack "myrack", data center "mydc" and region
+    "myregion"::
+
+      crush_location=rack:myrack|datacenter:mydc|region:myregion
+
+    Each key-value pair stands on its own: "myrack" doesn't need to reside in
+    "mydc", which in turn doesn't need to reside in "myregion".  The location
+    is not a path to the root of the hierarchy but rather a set of nodes that
+    are matched independently.  "Multipath" locations are supported, so it is
+    possible to indicate locality for multiple parallel hierarchies::
+
+      crush_location=rack:myrack1|rack:myrack2|datacenter:mydc
+
+
+:command:`read_from_replica=<no|balance|localize>`
+    - ``no``: Disable replica reads, always pick the primary OSD (since 5.8, default).
+
+    - ``balance``: When a replicated pool receives a read request, pick a random
+      OSD from the PG's acting set to serve it (since 5.8).
+
+      This mode is safe for general use only since Octopus (i.e. after "ceph osd
+      require-osd-release octopus"). Otherwise it should be limited to read-only
+      workloads such as snapshots.
+
+    - ``localize``: When a replicated pool receives a read request, pick the most
+      local OSD to serve it (since 5.8). The locality metric is calculated against
+      the location of the client given with crush_location; a match with the
+      lowest-valued bucket type wins.  For example, an OSD in a matching rack
+      is closer than an OSD in a matching data center, which in turn is closer
+      than an OSD in a matching region.
+
+      This mode is safe for general use only since Octopus (i.e. after "ceph osd
+      require-osd-release octopus").  Otherwise it should be limited to read-only
+      workloads such as snapshots.
+
+
 
 Examples
 ========
@@ -225,6 +279,10 @@ history::
 If authentication is disabled on Ceph cluster, omit the credential related option::
 
     mount.ceph fs_user@.mycephfs2=/ /mnt/mycephfs
+
+To mount using the old syntax::
+
+    mount -t ceph 192.168.0.1:/ /mnt/mycephfs
 
 Availability
 ============

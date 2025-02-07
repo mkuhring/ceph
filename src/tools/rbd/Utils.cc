@@ -13,6 +13,7 @@
 #include "common/escape.h"
 #include "common/safe_io.h"
 #include "global/global_context.h"
+#include <fstream>
 #include <iostream>
 #include <regex>
 #include <boost/algorithm/string.hpp>
@@ -273,6 +274,57 @@ int get_pool_image_id(const po::variables_map &vm,
   return 0;
 }
 
+int get_image_or_snap_spec(const po::variables_map &vm, std::string *spec) {
+  size_t arg_index = 0;
+  std::string pool_name;
+  std::string nspace_name;
+  std::string image_name;
+  std::string snap_name;
+  int r = get_pool_image_snapshot_names(
+    vm, at::ARGUMENT_MODIFIER_NONE, &arg_index, &pool_name, &nspace_name,
+    &image_name, &snap_name, true, SNAPSHOT_PRESENCE_PERMITTED,
+    SPEC_VALIDATION_NONE);
+  if (r < 0) {
+    return r;
+  }
+
+  if (pool_name.empty()) {
+    // connect to the cluster to get the default pool
+    librados::Rados rados;
+    r = init_rados(&rados);
+    if (r < 0) {
+      return r;
+    }
+
+    normalize_pool_name(&pool_name);
+  }
+
+  spec->append(pool_name);
+  spec->append("/");
+  if (!nspace_name.empty()) {
+    spec->append(nspace_name);
+    spec->append("/");
+  }
+  spec->append(image_name);
+  if (!snap_name.empty()) {
+    spec->append("@");
+    spec->append(snap_name);
+  }
+
+  return 0;
+}
+
+void append_options_as_args(const std::vector<std::string> &options,
+                            std::vector<std::string> *args) {
+  for (auto &opts : options) {
+    std::vector<std::string> args_;
+    boost::split(args_, opts, boost::is_any_of(","));
+    for (auto &o : args_) {
+      args->push_back("--" + o);
+    }
+  }
+}
+
 int get_pool_image_snapshot_names(const po::variables_map &vm,
                                   at::ArgumentModifier mod,
                                   size_t *spec_arg_index,
@@ -285,11 +337,14 @@ int get_pool_image_snapshot_names(const po::variables_map &vm,
                                   SpecValidation spec_validation) {
   std::string pool_key = (mod == at::ARGUMENT_MODIFIER_DEST ?
     at::DEST_POOL_NAME : at::POOL_NAME);
+  std::string namespace_key = (mod == at::ARGUMENT_MODIFIER_DEST ?
+    at::DEST_NAMESPACE_NAME : at::NAMESPACE_NAME);
   std::string image_key = (mod == at::ARGUMENT_MODIFIER_DEST ?
     at::DEST_IMAGE_NAME : at::IMAGE_NAME);
+
   return get_pool_generic_snapshot_names(vm, mod, spec_arg_index, pool_key,
-                                         pool_name, namespace_name, image_key,
-                                         "image", image_name, snap_name,
+                                         pool_name, namespace_key, namespace_name,
+                                         image_key, "image", image_name, snap_name,
                                          image_name_required, snapshot_presence,
                                          spec_validation);
 }
@@ -299,6 +354,7 @@ int get_pool_generic_snapshot_names(const po::variables_map &vm,
                                     size_t *spec_arg_index,
                                     const std::string& pool_key,
                                     std::string *pool_name,
+                                    const std::string& namespace_key,
                                     std::string *namespace_name,
                                     const std::string& generic_key,
                                     const std::string& generic_key_desc,
@@ -307,8 +363,6 @@ int get_pool_generic_snapshot_names(const po::variables_map &vm,
                                     bool generic_name_required,
                                     SnapshotPresence snapshot_presence,
                                     SpecValidation spec_validation) {
-  std::string namespace_key = (mod == at::ARGUMENT_MODIFIER_DEST ?
-    at::DEST_NAMESPACE_NAME : at::NAMESPACE_NAME);
   std::string snap_key = (mod == at::ARGUMENT_MODIFIER_DEST ?
     at::DEST_SNAPSHOT_NAME : at::SNAPSHOT_NAME);
 
@@ -426,10 +480,11 @@ int validate_snapshot_name(at::ArgumentModifier mod,
 int get_image_options(const boost::program_options::variables_map &vm,
 		      bool get_format, librbd::ImageOptions *opts) {
   uint64_t order = 0, stripe_unit = 0, stripe_count = 0, object_size = 0;
-  uint64_t features = 0, features_clear = 0;
+  uint64_t features = 0, features_set = 0, features_clear = 0;
   std::string data_pool;
   bool order_specified = true;
   bool features_specified = false;
+  bool features_set_specified = false;
   bool features_clear_specified = false;
   bool stripe_specified = false;
 
@@ -455,6 +510,13 @@ int get_image_options(const boost::program_options::variables_map &vm,
   if (vm.count(at::IMAGE_STRIPE_COUNT)) {
     stripe_count = vm[at::IMAGE_STRIPE_COUNT].as<uint64_t>();
     stripe_specified = true;
+  }
+
+  if (vm.count(at::IMAGE_MIRROR_IMAGE_MODE) &&
+      vm[at::IMAGE_MIRROR_IMAGE_MODE].as<librbd::mirror_image_mode_t>() ==
+      RBD_MIRROR_IMAGE_MODE_JOURNAL) {
+    features_set |= (RBD_FEATURE_EXCLUSIVE_LOCK | RBD_FEATURE_JOURNALING);
+    features_set_specified = true;
   }
 
   if (vm.count(at::IMAGE_SHARED) && vm[at::IMAGE_SHARED].as<bool>()) {
@@ -529,6 +591,8 @@ int get_image_options(const boost::program_options::variables_map &vm,
     opts->set(RBD_IMAGE_OPTION_ORDER, order);
   if (features_specified)
     opts->set(RBD_IMAGE_OPTION_FEATURES, features);
+  if (features_set_specified)
+    opts->set(RBD_IMAGE_OPTION_FEATURES_SET, features_set);
   if (features_clear_specified) {
     opts->set(RBD_IMAGE_OPTION_FEATURES_CLEAR, features_clear);
   }
@@ -665,6 +729,72 @@ int get_snap_create_flags(const po::variables_map &vm, uint32_t *flags) {
   } else if (vm[at::IGNORE_QUIESCE_ERROR].as<bool>()) {
     *flags |= RBD_SNAP_CREATE_IGNORE_QUIESCE_ERROR;
   }
+  return 0;
+}
+
+int get_encryption_options(const boost::program_options::variables_map &vm,
+                           EncryptionOptions* result) {
+  std::vector<std::string> passphrase_files;
+  if (vm.count(at::ENCRYPTION_PASSPHRASE_FILE)) {
+    passphrase_files =
+            vm[at::ENCRYPTION_PASSPHRASE_FILE].as<std::vector<std::string>>();
+  }
+
+  std::vector<at::EncryptionFormat> formats;
+  if (vm.count(at::ENCRYPTION_FORMAT)) {
+    formats = vm[at::ENCRYPTION_FORMAT].as<decltype(formats)>();
+  } else if (vm.count(at::ENCRYPTION_PASSPHRASE_FILE)) {
+    formats.resize(passphrase_files.size(),
+                   at::EncryptionFormat{RBD_ENCRYPTION_FORMAT_LUKS});
+  }
+
+  if (formats.size() != passphrase_files.size()) {
+    std::cerr << "rbd: encryption formats count does not match "
+              << "passphrase files count" << std::endl;
+    return -EINVAL;
+  }
+
+  result->specs.clear();
+  result->specs.reserve(formats.size());
+  for (size_t i = 0; i < formats.size(); ++i) {
+    std::ifstream file(passphrase_files[i], std::ios::in | std::ios::binary);
+    if (file.fail()) {
+      std::cerr << "rbd: unable to open passphrase file '"
+                << passphrase_files[i] << "': " << cpp_strerror(errno)
+                << std::endl;
+      return -errno;
+    }
+    std::string passphrase((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
+    file.close();
+
+    switch (formats[i].format) {
+    case RBD_ENCRYPTION_FORMAT_LUKS: {
+      auto opts = new librbd::encryption_luks_format_options_t{
+          std::move(passphrase)};
+      result->specs.push_back(
+          {RBD_ENCRYPTION_FORMAT_LUKS, opts, sizeof(*opts)});
+      break;
+    }
+    case RBD_ENCRYPTION_FORMAT_LUKS1: {
+      auto opts = new librbd::encryption_luks1_format_options_t{
+          .passphrase = std::move(passphrase)};
+      result->specs.push_back(
+          {RBD_ENCRYPTION_FORMAT_LUKS1, opts, sizeof(*opts)});
+      break;
+    }
+    case RBD_ENCRYPTION_FORMAT_LUKS2: {
+      auto opts = new librbd::encryption_luks2_format_options_t{
+          .passphrase = std::move(passphrase)};
+      result->specs.push_back(
+          {RBD_ENCRYPTION_FORMAT_LUKS2, opts, sizeof(*opts)});
+      break;
+    }
+    default:
+      ceph_abort();
+    }
+  }
+
   return 0;
 }
 
@@ -815,6 +945,7 @@ int init_and_open_image(const std::string &pool_name,
       return r;
     }
   }
+
   return 0;
 }
 

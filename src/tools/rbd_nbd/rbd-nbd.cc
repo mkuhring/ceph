@@ -106,7 +106,6 @@ struct Config {
   bool quiesce = false;
   bool readonly = false;
   bool set_max_part = false;
-  bool try_netlink = false;
   bool show_cookie = false;
 
   std::string poolname;
@@ -119,12 +118,13 @@ struct Config {
   std::string format;
   bool pretty_format = false;
 
-  std::optional<librbd::encryption_format_t> encryption_format;
-  std::optional<std::string> encryption_passphrase_file;
+  std::vector<librbd::encryption_format_t> encryption_formats;
+  std::vector<std::string> encryption_passphrase_files;
 
   Command command = None;
   int pid = 0;
   std::string cookie;
+  uint64_t snapid = CEPH_NOSNAP;
 
   std::string image_spec() const {
     std::string spec = poolname + "/";
@@ -151,8 +151,8 @@ static void usage()
             << "               [options] list-mapped                 List mapped nbd devices\n"
             << "Map and attach options:\n"
             << "  --device <device path>        Specify nbd device path (/dev/nbd{num})\n"
-            << "  --encryption-format           Image encryption format\n"
-            << "                                (possible values: luks1, luks2)\n"
+            << "  --encryption-format luks|luks1|luks2\n"
+            << "                                Image encryption format (default: luks)\n"
             << "  --encryption-passphrase-file  Path of file containing passphrase for unlocking image encryption\n"
             << "  --exclusive                   Forbid writes by other clients\n"
             << "  --notrim                      Turn off trim/discard\n"
@@ -165,9 +165,13 @@ static void usage()
             << "  --read-only                   Map read-only\n"
             << "  --reattach-timeout <sec>      Set nbd re-attach timeout\n"
             << "                                (default: " << Config().reattach_timeout << ")\n"
-            << "  --try-netlink                 Use the nbd netlink interface\n"
             << "  --show-cookie                 Show device cookie\n"
             << "  --cookie                      Specify device cookie\n"
+            << "  --snap-id <snap-id>           Specify snapshot by ID instead of by name\n"
+            << "\n"
+            << "Unmap and detach options:\n"
+            << "  --device <device path>        Specify nbd device path (/dev/nbd{num})\n"
+            << "  --snap-id <snap-id>           Specify snapshot by ID instead of by name\n"
             << "\n"
             << "List options:\n"
             << "  --format plain|json|xml Output format (default: plain)\n"
@@ -188,7 +192,8 @@ static EventSocket terminate_event_sock;
 static int parse_args(vector<const char*>& args, std::ostream *err_msg,
                       Config *cfg);
 static int netlink_disconnect(int index);
-static int netlink_resize(int nbd_index, uint64_t size);
+static int netlink_resize(int nbd_index, const std::string& cookie,
+                          uint64_t size);
 
 static int run_quiesce_hook(const std::string &quiesce_hook,
                             const std::string &devpath,
@@ -732,55 +737,108 @@ private:
   bool use_netlink;
   librados::IoCtx &io_ctx;
   librbd::Image &image;
-  unsigned long size;
+  uint64_t size;
+  std::thread handle_notify_thread;
+  ceph::condition_variable cond;
+  ceph::mutex lock = ceph::make_mutex("NBDWatchCtx::Locker");
+  bool notify = false;
+  bool terminated = false;
+  std::string cookie;
+
+  bool wait_notify() {
+    dout(10) << __func__ << dendl;
+
+    std::unique_lock locker{lock};
+    cond.wait(locker, [this] { return notify || terminated; });
+
+    if (terminated) {
+      return false;
+    }
+
+    dout(10) << __func__ << ": got notify request" << dendl;
+    notify = false;
+    return true;
+  }
+
+  void handle_notify_entry() {
+    dout(10) << __func__ << dendl;
+
+    while (wait_notify()) {
+      uint64_t new_size;
+      int ret = image.size(&new_size);
+      if (ret < 0) {
+        derr << "getting image size failed: " << cpp_strerror(ret) << dendl;
+        continue;
+      }
+      if (new_size == size) {
+        continue;
+      }
+      dout(5) << "resize detected" << dendl;
+      if (ioctl(fd, BLKFLSBUF, NULL) < 0) {
+        derr << "invalidate page cache failed: " << cpp_strerror(errno)
+             << dendl;
+      }
+      if (use_netlink) {
+        ret = netlink_resize(nbd_index, cookie, new_size);
+      } else {
+        ret = ioctl(fd, NBD_SET_SIZE, new_size);
+        if (ret < 0) {
+          derr << "ioctl resize failed: " << cpp_strerror(errno) << dendl;
+        }
+      }
+      if (!ret) {
+        size = new_size;
+      }
+      if (ioctl(fd, BLKRRPART, NULL) < 0) {
+        derr << "rescan of partition table failed: " << cpp_strerror(errno)
+             << dendl;
+      }
+      if (image.invalidate_cache() < 0) {
+        derr << "invalidate rbd cache failed" << dendl;
+      }
+    }
+  }
+
 public:
   NBDWatchCtx(int _fd,
               int _nbd_index,
               bool _use_netlink,
               librados::IoCtx &_io_ctx,
               librbd::Image &_image,
-              unsigned long _size)
+              unsigned long _size,
+              std::string _cookie)
     : fd(_fd)
     , nbd_index(_nbd_index)
     , use_netlink(_use_netlink)
     , io_ctx(_io_ctx)
     , image(_image)
     , size(_size)
-  { }
+    , cookie(std::move(_cookie))
+  {
+    handle_notify_thread = make_named_thread("rbd_handle_notify",
+                                             &NBDWatchCtx::handle_notify_entry,
+                                             this);
+  }
 
-  ~NBDWatchCtx() override {}
+  ~NBDWatchCtx() override
+  {
+    dout(10) << __func__ << ": terminating" << dendl;
+    std::unique_lock locker{lock};
+    terminated = true;
+    cond.notify_all();
+    locker.unlock();
+
+    handle_notify_thread.join();
+    dout(10) << __func__ << ": finish" << dendl;
+  }
 
   void handle_notify() override
   {
-    librbd::image_info_t info;
-    if (image.stat(info, sizeof(info)) == 0) {
-      unsigned long new_size = info.size;
-      int ret;
+    dout(10) << __func__ << dendl;
 
-      if (new_size != size) {
-        dout(5) << "resize detected" << dendl;
-        if (ioctl(fd, BLKFLSBUF, NULL) < 0)
-          derr << "invalidate page cache failed: " << cpp_strerror(errno)
-               << dendl;
-	if (use_netlink) {
-	  ret = netlink_resize(nbd_index, new_size);
-	} else {
-          ret = ioctl(fd, NBD_SET_SIZE, new_size);
-          if (ret < 0)
-            derr << "resize failed: " << cpp_strerror(errno) << dendl;
-	}
-
-        if (!ret)
-          size = new_size;
-
-        if (ioctl(fd, BLKRRPART, NULL) < 0) {
-          derr << "rescan of partition table failed: " << cpp_strerror(errno)
-               << dendl;
-        }
-        if (image.invalidate_cache() < 0)
-          derr << "invalidate rbd cache failed" << dendl;
-      }
-    }
+    std::unique_lock locker{lock};
+    notify = true;
+    cond.notify_all();
   }
 };
 
@@ -934,6 +992,43 @@ private:
     }
 
     return -1;
+  }
+};
+
+struct EncryptionOptions {
+  std::vector<librbd::encryption_spec_t> specs;
+
+  ~EncryptionOptions() {
+    for (auto& spec : specs) {
+      switch (spec.format) {
+      case RBD_ENCRYPTION_FORMAT_LUKS: {
+        auto opts =
+            static_cast<librbd::encryption_luks_format_options_t*>(spec.opts);
+        ceph_memzero_s(opts->passphrase.data(), opts->passphrase.size(),
+                       opts->passphrase.size());
+        delete opts;
+        break;
+      }
+      case RBD_ENCRYPTION_FORMAT_LUKS1: {
+        auto opts =
+            static_cast<librbd::encryption_luks1_format_options_t*>(spec.opts);
+        ceph_memzero_s(opts->passphrase.data(), opts->passphrase.size(),
+                       opts->passphrase.size());
+        delete opts;
+        break;
+      }
+      case RBD_ENCRYPTION_FORMAT_LUKS2: {
+        auto opts =
+            static_cast<librbd::encryption_luks2_format_options_t*>(spec.opts);
+        ceph_memzero_s(opts->passphrase.data(), opts->passphrase.size(),
+                       opts->passphrase.size());
+        delete opts;
+        break;
+      }
+      default:
+        ceph_abort();
+      }
+    }
   }
 };
 
@@ -1226,7 +1321,8 @@ static int netlink_disconnect_by_path(const std::string& devpath)
   return netlink_disconnect(index);
 }
 
-static int netlink_resize(int nbd_index, uint64_t size)
+static int netlink_resize(int nbd_index, const std::string& cookie,
+                          uint64_t size)
 {
   struct nl_sock *sock;
   struct nl_msg *msg;
@@ -1234,30 +1330,33 @@ static int netlink_resize(int nbd_index, uint64_t size)
 
   sock = netlink_init(&nl_id);
   if (!sock) {
-    cerr << "rbd-nbd: Netlink interface not supported." << std::endl;
-    return 1;
+    derr << __func__ << ": netlink interface not supported" << dendl;
+    return -EINVAL;
   }
 
   nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, genl_handle_msg, NULL);
 
   msg = nlmsg_alloc();
   if (!msg) {
-    cerr << "rbd-nbd: Could not allocate netlink message." << std::endl;
+    derr << __func__ << ": could not allocate netlink message" << dendl;
     goto free_sock;
   }
 
   if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, nl_id, 0, 0,
                    NBD_CMD_RECONFIGURE, 0)) {
-    cerr << "rbd-nbd: Could not setup message." << std::endl;
+    derr << __func__ << ": could not setup netlink message" << dendl;
     goto free_msg;
   }
 
   NLA_PUT_U32(msg, NBD_ATTR_INDEX, nbd_index);
   NLA_PUT_U64(msg, NBD_ATTR_SIZE_BYTES, size);
+  if (!cookie.empty())
+    NLA_PUT_STRING(msg, NBD_ATTR_BACKEND_IDENTIFIER, cookie.c_str());
 
   ret = nl_send_sync(sock, msg);
   if (ret < 0) {
-    cerr << "rbd-nbd: netlink resize failed: " << nl_geterror(ret) << std::endl;
+    derr << __func__ << ": netlink resize failed: " << nl_geterror(ret)
+         << dendl;
     goto free_sock;
   }
 
@@ -1581,7 +1680,7 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
   unsigned long flags;
   unsigned long size;
   unsigned long blksize = RBD_NBD_BLKSIZE;
-  bool use_netlink;
+  bool use_netlink = true;
 
   int fd[2];
 
@@ -1656,61 +1755,78 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
     }
   }
 
-  if (!cfg->snapname.empty()) {
-    r = image.snap_set(cfg->snapname.c_str());
-    if (r < 0)
+  if (cfg->snapid != CEPH_NOSNAP) {
+    r = image.snap_set_by_id(cfg->snapid);
+    if (r < 0) {
+      cerr << "rbd-nbd: failed to set snap id: " << cpp_strerror(r)
+           << std::endl;
       goto close_fd;
+    }
+  } else if (!cfg->snapname.empty()) {
+    r = image.snap_set(cfg->snapname.c_str());
+    if (r < 0) {
+      cerr << "rbd-nbd: failed to set snap name: " << cpp_strerror(r)
+           << std::endl;
+      goto close_fd;
+    }
   }
 
-  if (cfg->encryption_format.has_value()) {
-    if (!cfg->encryption_passphrase_file.has_value()) {
-      r = -EINVAL;
-      cerr << "rbd-nbd: missing encryption-passphrase-file" << std::endl;
-      goto close_fd;
-    }
-    std::ifstream file(cfg->encryption_passphrase_file.value().c_str());
-    if (file.fail()) {
-      r = -errno;
-      std::cerr << "rbd-nbd: unable to open passphrase file:"
-                << cpp_strerror(errno) << std::endl;
-      goto close_fd;
-    }
-    std::string passphrase((std::istreambuf_iterator<char>(file)),
-                           (std::istreambuf_iterator<char>()));
-    auto sg = make_scope_guard([&] {
-      ceph_memzero_s(&passphrase[0], passphrase.size(), passphrase.size()); });
-    file.close();
-    if (!passphrase.empty() && passphrase[passphrase.length() - 1] == '\n') {
-      passphrase.erase(passphrase.length() - 1);
-    }
+  if (!cfg->encryption_formats.empty()) {
+    EncryptionOptions encryption_options;
+    encryption_options.specs.reserve(cfg->encryption_formats.size());
 
-    switch (cfg->encryption_format.value()) {
+    for (size_t i = 0; i < cfg->encryption_formats.size(); ++i) {
+      std::ifstream file(cfg->encryption_passphrase_files[i],
+                         std::ios::in | std::ios::binary);
+      if (file.fail()) {
+        r = -errno;
+        std::cerr << "rbd-nbd: unable to open passphrase file '"
+                  << cfg->encryption_passphrase_files[i] << "': "
+                  << cpp_strerror(r) << std::endl;
+        goto close_fd;
+      }
+      std::string passphrase((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+      file.close();
+
+      switch (cfg->encryption_formats[i]) {
+      case RBD_ENCRYPTION_FORMAT_LUKS: {
+        auto opts = new librbd::encryption_luks_format_options_t{
+            std::move(passphrase)};
+        encryption_options.specs.push_back(
+            {RBD_ENCRYPTION_FORMAT_LUKS, opts, sizeof(*opts)});
+        break;
+      }
       case RBD_ENCRYPTION_FORMAT_LUKS1: {
-        librbd::encryption_luks1_format_options_t opts = {};
-        opts.passphrase = passphrase;
-        r = image.encryption_load(
-                RBD_ENCRYPTION_FORMAT_LUKS1, &opts, sizeof(opts));
+        auto opts = new librbd::encryption_luks1_format_options_t{
+            .passphrase = std::move(passphrase)};
+        encryption_options.specs.push_back(
+            {RBD_ENCRYPTION_FORMAT_LUKS1, opts, sizeof(*opts)});
         break;
       }
       case RBD_ENCRYPTION_FORMAT_LUKS2: {
-        librbd::encryption_luks2_format_options_t opts = {};
-        opts.passphrase = passphrase;
-        r = image.encryption_load(
-                RBD_ENCRYPTION_FORMAT_LUKS2, &opts, sizeof(opts));
-        blksize = 4096;
+        auto opts = new librbd::encryption_luks2_format_options_t{
+            .passphrase = std::move(passphrase)};
+        encryption_options.specs.push_back(
+            {RBD_ENCRYPTION_FORMAT_LUKS2, opts, sizeof(*opts)});
         break;
       }
       default:
-        r = -ENOTSUP;
-        cerr << "rbd-nbd: unsupported encryption format" << std::endl;
-        goto close_fd;
+        ceph_abort();
+      }
     }
 
+    r = image.encryption_load2(encryption_options.specs.data(),
+                               encryption_options.specs.size());
     if (r != 0) {
       cerr << "rbd-nbd: failed to load encryption: " << cpp_strerror(r)
            << std::endl;
       goto close_fd;
     }
+
+    // luks2 block size can vary upto 4096, while luks1 always uses 512
+    // currently we don't have an rbd API for querying the loaded encryption
+    blksize = 4096;
   }
 
   r = image.stat(info, sizeof(info));
@@ -1741,20 +1857,17 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
 
   server = start_server(fd[1], image, cfg);
 
-  use_netlink = cfg->try_netlink || reconnect;
-  if (use_netlink) {
-    // generate when the cookie is not supplied at CLI
-    if (!reconnect && cfg->cookie.empty()) {
-      uuid_d uuid_gen;
-      uuid_gen.generate_random();
-      cfg->cookie = uuid_gen.to_string();
-    }
-    r = try_netlink_setup(cfg, fd[0], size, flags, reconnect);
-    if (r < 0) {
-      goto free_server;
-    } else if (r == 1) {
-      use_netlink = false;
-    }
+  // generate when the cookie is not supplied at CLI
+  if (!reconnect && cfg->cookie.empty()) {
+    uuid_d uuid_gen;
+    uuid_gen.generate_random();
+    cfg->cookie = uuid_gen.to_string();
+  }
+  r = try_netlink_setup(cfg, fd[0], size, flags, reconnect);
+  if (r < 0) {
+    goto free_server;
+  } else if (r == 1) {
+    use_netlink = false;
   }
 
   if (!use_netlink) {
@@ -1786,7 +1899,7 @@ static int do_map(int argc, const char *argv[], Config *cfg, bool reconnect)
     uint64_t handle;
 
     NBDWatchCtx watch_ctx(nbd, nbd_index, use_netlink, io_ctx, image,
-                          info.size);
+                          info.size, cfg->cookie);
     r = image.update_watch(&watch_ctx, &handle);
     if (r < 0)
       goto close_nbd;
@@ -1944,23 +2057,23 @@ static int do_list_mapped_devices(const std::string &format, bool pretty_format)
   Config cfg;
   NBDListIterator it;
   while (it.get(&cfg)) {
+    std::string snap = (cfg.snapid != CEPH_NOSNAP ?
+        "@" + std::to_string(cfg.snapid) : cfg.snapname);
     if (f) {
       f->open_object_section("device");
       f->dump_int("id", cfg.pid);
       f->dump_string("pool", cfg.poolname);
       f->dump_string("namespace", cfg.nsname);
       f->dump_string("image", cfg.imgname);
-      f->dump_string("snap", cfg.snapname);
+      f->dump_string("snap", snap);
       f->dump_string("device", cfg.devpath);
       f->dump_string("cookie", cfg.cookie);
       f->close_section();
     } else {
       should_print = true;
-      if (cfg.snapname.empty()) {
-        cfg.snapname = "-";
-      }
       tbl << cfg.pid << cfg.poolname << cfg.nsname << cfg.imgname
-          << cfg.snapname << cfg.devpath << cfg.cookie << TextTable::endrow;
+          << (snap.empty() ? "-" : snap) << cfg.devpath << cfg.cookie
+	  << TextTable::endrow;
     }
   }
 
@@ -1981,7 +2094,8 @@ static bool find_mapped_dev_by_spec(Config *cfg, int skip_pid=-1) {
     if (c.pid != skip_pid &&
         c.poolname == cfg->poolname && c.nsname == cfg->nsname &&
         c.imgname == cfg->imgname && c.snapname == cfg->snapname &&
-        (cfg->devpath.empty() || c.devpath == cfg->devpath)) {
+        (cfg->devpath.empty() || c.devpath == cfg->devpath) &&
+        c.snapid == cfg->snapid) {
       *cfg = c;
       return true;
     }
@@ -2024,6 +2138,7 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
   std::vector<const char*>::iterator i;
   std::ostringstream err;
   std::string arg_value;
+  long long snapid;
 
   for (i = args.begin(); i != args.end(); ) {
     if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
@@ -2096,18 +2211,30 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
     } else if (ceph_argparse_flag(args, i, "--pretty-format", (char *)NULL)) {
       cfg->pretty_format = true;
     } else if (ceph_argparse_flag(args, i, "--try-netlink", (char *)NULL)) {
-      cfg->try_netlink = true;
+      // netlink used by default. option not required anymore.
+      // accept for compatibility.
     } else if (ceph_argparse_flag(args, i, "--show-cookie", (char *)NULL)) {
       cfg->show_cookie = true;
     } else if (ceph_argparse_witharg(args, i, &cfg->cookie, "--cookie", (char *)NULL)) {
+    } else if (ceph_argparse_witharg(args, i, &snapid, err,
+                                     "--snap-id", (char *)NULL)) {
+      if (!err.str().empty()) {
+        *err_msg << "rbd-nbd: " << err.str();
+        return -EINVAL;
+      }
+      if (snapid < 0) {
+        *err_msg << "rbd-nbd: Invalid argument for snap-id!";
+        return -EINVAL;
+      }
+      cfg->snapid = snapid;
     } else if (ceph_argparse_witharg(args, i, &arg_value,
                                      "--encryption-format", (char *)NULL)) {
       if (arg_value == "luks1") {
-        cfg->encryption_format =
-                std::make_optional(RBD_ENCRYPTION_FORMAT_LUKS1);
+        cfg->encryption_formats.push_back(RBD_ENCRYPTION_FORMAT_LUKS1);
       } else if (arg_value == "luks2") {
-        cfg->encryption_format =
-                std::make_optional(RBD_ENCRYPTION_FORMAT_LUKS2);
+        cfg->encryption_formats.push_back(RBD_ENCRYPTION_FORMAT_LUKS2);
+      } else if (arg_value == "luks") {
+        cfg->encryption_formats.push_back(RBD_ENCRYPTION_FORMAT_LUKS);
       } else {
         *err_msg << "rbd-nbd: Invalid encryption format";
         return -EINVAL;
@@ -2115,10 +2242,22 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
     } else if (ceph_argparse_witharg(args, i, &arg_value,
                                      "--encryption-passphrase-file",
                                      (char *)NULL)) {
-      cfg->encryption_passphrase_file = std::make_optional(arg_value);
+      cfg->encryption_passphrase_files.push_back(arg_value);
     } else {
       ++i;
     }
+  }
+
+  if (cfg->encryption_formats.empty() &&
+      !cfg->encryption_passphrase_files.empty()) {
+    cfg->encryption_formats.resize(cfg->encryption_passphrase_files.size(),
+                                   RBD_ENCRYPTION_FORMAT_LUKS);
+  }
+
+  if (cfg->encryption_formats.size() != cfg->encryption_passphrase_files.size()) {
+    *err_msg << "rbd-nbd: Encryption formats count does not match "
+             << "passphrase files count";
+    return -EINVAL;
   }
 
   Command cmd = None;
@@ -2196,6 +2335,11 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
     default:
       //shut up gcc;
       break;
+  }
+
+  if (cfg->snapid != CEPH_NOSNAP && !cfg->snapname.empty()) {
+    *err_msg << "rbd-nbd: use either snapname or snapid, not both";
+    return -EINVAL;
   }
 
   if (args.begin() != args.end()) {

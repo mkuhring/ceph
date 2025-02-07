@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <iterator>
 #include <random>
+
+#include <boost/asio/post.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/filtered.hpp>
 #include <boost/range/algorithm/copy.hpp>
@@ -129,7 +131,7 @@ int MonClient::get_monmap_and_config()
   messenger = Messenger::create_client_messenger(
     cct, "temp_mon_client");
   ceph_assert(messenger);
-  messenger->add_dispatcher_head(this);
+  messenger->add_dispatcher_head(this, Dispatcher::PRIORITY_HIGH);
   messenger->start();
   auto shutdown_msgr = make_scope_guard([this] {
     messenger->shutdown();
@@ -154,11 +156,8 @@ int MonClient::get_monmap_and_config()
     if (r < 0) {
       return r;
     }
-    r = authenticate(std::chrono::duration<double>(cct->_conf.get_val<std::chrono::seconds>("client_mount_timeout")).count());
-    if (r == -ETIMEDOUT) {
-      shutdown();
-      continue;
-    }
+    r = authenticate(
+      cct->_conf.get_val<std::chrono::seconds>("client_mount_timeout").count());
     if (r < 0) {
       break;
     }
@@ -266,7 +265,7 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
 						result_reply);
 
   Messenger *smsgr = Messenger::create_client_messenger(cct, "temp_ping_client");
-  smsgr->add_dispatcher_head(pinger);
+  smsgr->add_dispatcher_head(pinger, Dispatcher::PRIORITY_HIGH);
   smsgr->set_auth_client(pinger);
   smsgr->start();
 
@@ -296,6 +295,7 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
 
 bool MonClient::ms_dispatch(Message *m)
 {
+  ldout(cct, 25) << __func__ << " processing " << m << dendl;
   // we only care about these message types
   switch (m->get_type()) {
   case CEPH_MSG_MON_MAP:
@@ -512,10 +512,15 @@ int MonClient::init()
   initialized = true;
 
   messenger->set_auth_client(this);
-  messenger->add_dispatcher_head(this);
+  messenger->add_dispatcher_head(this, Dispatcher::PRIORITY_HIGH);
 
   timer.init();
   schedule_tick();
+
+  cct->get_admin_socket()->register_command(
+    "rotate-key",
+    this,
+    "rotate live authentication key");
 
   return 0;
 }
@@ -523,6 +528,9 @@ int MonClient::init()
 void MonClient::shutdown()
 {
   ldout(cct, 10) << __func__ << dendl;
+
+  cct->get_admin_socket()->unregister_commands(this);
+  
   monc_lock.lock();
   stopping = true;
   while (!version_requests.empty()) {
@@ -603,6 +611,33 @@ int MonClient::authenticate(double timeout)
   return authenticate_err;
 }
 
+int MonClient::call(
+    std::string_view command,
+    const cmdmap_t& cmdmap,
+    const ceph::buffer::list &inbl,
+    ceph::Formatter *f,
+    std::ostream& errss,
+    ceph::buffer::list& out)
+{
+  if (command == "rotate-key") {
+    CryptoKey key;
+    try {
+      key.decode_base64(inbl.to_str());
+    } catch (buffer::error& e) {
+      errss << "error decoding key: " << e.what();
+      return -EINVAL;
+    }
+    if (keyring) {
+      ldout(cct, 1) << "rotate live key for " << entity_name << dendl;
+      keyring->add(entity_name, key);
+    } else {
+      errss << "cephx not enabled; no key to rotate";
+      return -EINVAL;
+    }
+  }
+  return 0;
+}
+
 void MonClient::handle_auth(MAuthReply *m)
 {
   ceph_assert(ceph_mutex_is_locked(monc_lock));
@@ -674,6 +709,11 @@ void MonClient::_finish_auth(int auth_err)
   if (!auth_err && active_con) {
     ceph_assert(auth);
     _check_auth_tickets();
+  } else if (auth_err == -EAGAIN && !active_con) {
+    ldout(cct,10) << __func__ 
+                  << " auth returned EAGAIN, reopening the session to try again"
+                  << dendl;
+    _reopen_session();
   }
   auth_cond.notify_all();
 }
@@ -711,6 +751,10 @@ void MonClient::_reopen_session(int rank)
   authenticate_err = 1;  // == in progress
 
   _start_hunting();
+
+  if (rank == -1) {
+    rank = cct->_conf.get_val<int64_t>("mon_client_target_rank");
+  }
 
   if (rank >= 0) {
     _add_conn(rank);
@@ -1205,6 +1249,7 @@ void MonClient::_send_command(MonCommand *r)
   }
 
   // normal CLI command
+  r->sent_name = active_con ? monmap.get_name(active_con->get_con()->get_peer_addr()) : "";
   ldout(cct, 10) << __func__ << " " << r->tid << " " << r->cmd << dendl;
   auto m = ceph::make_message<MMonCommand>(monmap.fsid);
   m->set_tid(r->tid);
@@ -1242,6 +1287,25 @@ void MonClient::_resend_mon_commands()
       // starting with octopus, tell commands use their own connetion and need no
       // special resend when we finish hunting.
     } else {
+      if (!cct->_conf->mon_client_hunt_on_resend) {
+        // Ensure the target name of the resend mon command matches the rank
+        // of the current active connection.
+        ldout(cct, 20) << __func__ << " " << cmd->tid << " " << cmd->cmd
+                       << " last sent_name " << cmd->sent_name << dendl;
+        if (!monmap.contains(cmd->sent_name)) {
+          ldout(cct, 20) << __func__ << " " << cmd->tid << " " << cmd->cmd
+                        << " sent_name " << cmd->sent_name << " not in monmap using mon:" <<
+                        monmap.get_name(active_con->get_con()->get_peer_addr()) << dendl;
+        } else if (active_con && cmd->sent_name.length() &&
+                   cmd->sent_name != monmap.get_name(active_con->get_con()->get_peer_addr()) &&
+                   monmap.contains(cmd->sent_name)) {
+          ldout(cct, 20) << __func__ << " " << cmd->tid << " " << cmd->cmd
+                         << " wants mon " << cmd->sent_name
+                         << " current connection is " << monmap.get_name(active_con->get_con()->get_peer_addr())
+                         << ", reopening session" << dendl;
+          _reopen_session(monmap.get_rank(cmd->sent_name));
+        }
+      }
       _send_command(cmd); // might remove cmd from mon_commands
     }
   }
@@ -1565,8 +1629,9 @@ int MonClient::handle_auth_request(
     // for some channels prior to nautilus (osd heartbeat), we
     // tolerate the lack of an authorizer.
     if (!con->get_messenger()->require_authorizer) {
-      handle_authentication_dispatcher->ms_handle_authentication(con);
-      return 1;
+      if (handle_authentication_dispatcher->ms_handle_fast_authentication(con)) {
+        return 1;
+      }
     }
     return -EACCES;
   }
@@ -1603,8 +1668,10 @@ int MonClient::handle_auth_request(
     &auth_meta->connection_secret,
     ac);
   if (isvalid) {
-    handle_authentication_dispatcher->ms_handle_authentication(con);
-    return 1;
+    if (handle_authentication_dispatcher->ms_handle_fast_authentication(con)) {
+      return 1;
+    }
+    return -EACCES;
   }
   if (!more && !was_challenge && auth_meta->authorizer_challenge) {
     ldout(cct,10) << __func__ << " added challenge on " << con << dendl;

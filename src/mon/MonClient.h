@@ -22,11 +22,16 @@
 #include <string>
 #include <vector>
 
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
+
 #include "msg/Messenger.h"
 
 #include "MonMap.h"
 #include "MonSub.h"
 
+#include "common/admin_socket.h"
 #include "common/async/completion.h"
 #include "common/Timer.h"
 #include "common/config.h"
@@ -269,7 +274,8 @@ const boost::system::error_category& monc_category() noexcept;
 
 class MonClient : public Dispatcher,
 		  public AuthClient,
-		  public AuthServer /* for mgr, osd, mds */ {
+		  public AuthServer, /* for mgr, osd, mds */
+		  public AdminSocketHook {
   static constexpr auto dout_subsys = ceph_subsys_monc;
 public:
   // Error, Newest, Oldest
@@ -295,7 +301,8 @@ private:
   mutable ceph::mutex monc_lock = ceph::make_mutex("MonClient::monc_lock");
   SafeTimer timer;
   boost::asio::io_context& service;
-  boost::asio::io_context::strand finish_strand{service};
+  boost::asio::strand<boost::asio::io_context::executor_type>
+      finish_strand{service.get_executor()};
 
   bool initialized;
   bool stopping = false;
@@ -315,6 +322,14 @@ private:
 
   void handle_auth(MAuthReply *m);
 
+  int call(
+    std::string_view command,
+    const cmdmap_t& cmdmap,
+    const ceph::buffer::list &inbl,
+    ceph::Formatter *f,
+    std::ostream& errss,
+    ceph::buffer::list& out) override;
+  
   // monitor session
   utime_t last_keepalive;
   utime_t last_send_log;
@@ -544,6 +559,7 @@ private:
   struct MonCommand {
     // for tell only
     std::string target_name;
+    std::string sent_name;
     int target_rank = -1;
     ConnectionRef target_con;
     std::unique_ptr<MonConnection> target_session;

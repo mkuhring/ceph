@@ -35,23 +35,48 @@ SKIP_ZIP=${SKIP_ZIP:-}
 # well as llvm rely on mspdb*.dll in order to support this proprietary format.
 EMBEDDED_DBG_SYM=${EMBEDDED_DBG_SYM:-}
 # Allow for OS specific customizations through the OS flag.
-# Valid options are currently "ubuntu" and "suse".
+# Valid options are currently "ubuntu", "suse", and "rhel".
 
 OS=${OS}
 if [[ -z $OS ]]; then
-    if [[ -f /etc/os-release ]] && \
-            $(grep -q "^NAME=\".*SUSE.*\"" /etc/os-release);  then
+    source /etc/os-release
+    case "$ID" in
+    opensuse*|suse|sles)
         OS="suse"
-    elif [[ -f /etc/lsb-release ]] && \
-            $(grep -q "^DISTRIB_ID=Ubuntu" /etc/lsb-release);  then
+        ;;
+    rhel|centos)
+        OS="rhel"
+        ;;
+    ubuntu)
         OS="ubuntu"
-    else
-        echo "Unsupported Linux distro, only SUSE and Ubuntu are currently \
-supported. Set the OS variable to override"
+        ;;
+    *)
+        echo "Unsupported Linux distro $ID."
+        echo "only SUSE, Ubuntu and RHEL are supported."
+        echo "Set the OS environment variable to override."
         exit 1
-    fi
+        ;;
+    esac
 fi
-export OS="$OS"
+
+# The main advantages of mingw-llvm:
+# * not affected by the libstdc++/winpthread rw lock bugs
+# * can generate pdb debug symbols, which are compatible with WinDBG
+TOOLCHAIN=${TOOLCHAIN:-"mingw-llvm"}
+
+case "$TOOLCHAIN" in
+    mingw-llvm)
+        echo "Using mingw-llvm."
+        USE_MINGW_LLVM=1
+        ;;
+    mingw-gcc)
+        echo "Using mingw-gcc"
+        ;;
+    *)
+        echo "Unsupported toolchain: $TOOLCHAIN."
+        echo "Allowed toolchains: mingw-llvm or mingw-gcc."
+esac
+
 
 # We'll have to be explicit here since auto-detecting doesn't work
 # properly when cross compiling.
@@ -67,9 +92,7 @@ if [[ -z $CMAKE_BUILD_TYPE ]]; then
   CMAKE_BUILD_TYPE=Release
 fi
 
-# Some tests can't use shared libraries yet due to unspecified dependencies.
-# We'll do a static build by default for now.
-ENABLE_SHARED=${ENABLE_SHARED:-OFF}
+ENABLE_SHARED=${ENABLE_SHARED:-ON}
 
 binDir="$BUILD_DIR/bin"
 strippedBinDir="$BUILD_DIR/bin_stripped"
@@ -82,7 +105,6 @@ depsToolsetDir="$DEPS_DIR/mingw"
 cmakeGenerator="Ninja"
 lz4Dir="${depsToolsetDir}/lz4"
 sslDir="${depsToolsetDir}/openssl"
-curlDir="${depsToolsetDir}/curl"
 boostDir="${depsToolsetDir}/boost"
 zlibDir="${depsToolsetDir}/zlib"
 backtraceDir="${depsToolsetDir}/libbacktrace"
@@ -93,7 +115,7 @@ wnbdLibDir="${depsToolsetDir}/wnbd/lib"
 dokanSrcDir="${depsSrcDir}/dokany"
 dokanLibDir="${depsToolsetDir}/dokany/lib"
 
-depsDirs="$lz4Dir;$curlDir;$sslDir;$boostDir;$zlibDir;$backtraceDir;$snappyDir"
+depsDirs="$lz4Dir;$sslDir;$boostDir;$zlibDir;$backtraceDir;$snappyDir"
 depsDirs+=";$winLibDir"
 
 # Cmake recommends using CMAKE_PREFIX_PATH instead of link_directories.
@@ -104,8 +126,6 @@ linkDirs="$zlibDir/lib"
 
 lz4Lib="${lz4Dir}/lib/dll/liblz4-1.dll"
 lz4Include="${lz4Dir}/lib"
-curlLib="${curlDir}/lib/libcurl.dll.a"
-curlInclude="${curlDir}/include"
 
 if [[ -n $CLEAN_BUILD ]]; then
     echo "Cleaning up build dir: $BUILD_DIR"
@@ -122,8 +142,12 @@ cd $BUILD_DIR
 
 if [[ ! -f ${depsToolsetDir}/completed ]]; then
     echo "Preparing dependencies: $DEPS_DIR. Log: ${BUILD_DIR}/build_deps.log"
-    NUM_WORKERS=$NUM_WORKERS DEPS_DIR=$DEPS_DIR OS="$OS"\
-        "$SCRIPT_DIR/win32_deps_build.sh" | tee "${BUILD_DIR}/build_deps.log"
+    NUM_WORKERS=$NUM_WORKERS \
+        DEPS_DIR=$DEPS_DIR \
+        OS="$OS" \
+        ENABLE_SHARED=$ENABLE_SHARED \
+        USE_MINGW_LLVM=$USE_MINGW_LLVM \
+            "$SCRIPT_DIR/win32_deps_build.sh" | tee "${BUILD_DIR}/build_deps.log"
 fi
 
 # Due to distribution specific mingw settings, the mingw.cmake file
@@ -157,7 +181,9 @@ fi
 cmake -D CMAKE_PREFIX_PATH=$depsDirs \
       -D MINGW_LINK_DIRECTORIES="$linkDirs" \
       -D CMAKE_TOOLCHAIN_FILE="$MINGW_CMAKE_FILE" \
+      -D WITH_FMT_HEADER_ONLY=ON \
       -D WITH_LIBCEPHSQLITE=OFF \
+      -D WITH_QATLIB=OFF -D WITH_QATZIP=OFF \
       -D WITH_RDMA=OFF -D WITH_OPENLDAP=OFF \
       -D WITH_GSSAPI=OFF -D WITH_XFS=OFF \
       -D WITH_FUSE=OFF -D WITH_DOKAN=ON \
@@ -193,7 +219,8 @@ if [[ -z $SKIP_BUILD ]]; then
     # TODO: do we actually need the ceph compression libs?
     ninja_targets+=" compressor ceph_lz4 ceph_snappy ceph_zlib ceph_zstd"
     if [[ -z $SKIP_TESTS ]]; then
-      ninja_targets+=" tests ceph_radosacl ceph_scratchtool"
+      ninja_targets+=" tests ceph_radosacl ceph_scratchtool "
+      ninja_targets+=`ninja -t targets | grep ceph_test | cut -d ":" -f 1 | grep -v exe`
     fi
 
     ninja -v $ninja_targets 2>&1 | tee "${BUILD_DIR}/build.log"
@@ -206,10 +233,22 @@ if [[ -z $SKIP_DLL_COPY ]]; then
         $lz4Dir/lib/dll/liblz4-1.dll
         $sslDir/bin/libcrypto-1_1-x64.dll
         $sslDir/bin/libssl-1_1-x64.dll
-        $mingwTargetLibDir/libstdc++-6.dll
-        $mingwTargetLibDir/libgcc_s_seh-1.dll
-        $mingwLibpthreadDir/libwinpthread-1.dll
-        $boostDir/lib/*.dll)
+        $mingwLibpthreadDir/libwinpthread-1.dll)
+    if [[ $ENABLE_SHARED == "ON" ]]; then
+        required_dlls+=(
+            $boostDir/lib/*.dll
+        )
+    fi
+    if [[ -n $USE_MINGW_LLVM ]]; then
+        required_dlls+=(
+            $mingwTargetLibDir/libc++.dll
+            $mingwTargetLibDir/libunwind.dll)
+    else
+        required_dlls+=(
+            $mingwTargetLibDir/libstdc++-6.dll
+            $mingwTargetLibDir/libssp*.dll
+            $mingwTargetLibDir/libgcc_s_seh-1.dll)
+    fi
     echo "Copying required dlls to $binDir."
     cp ${required_dlls[@]} $binDir
 fi

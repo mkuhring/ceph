@@ -3,7 +3,7 @@ import { Injectable } from '@angular/core';
 
 import { Observable, throwError } from 'rxjs';
 
-import { NfsFSAbstractionLayer } from '~/app/ceph/nfs/models/nfs.fsal';
+import { NfsFSAbstractionLayer, SUPPORTED_FSAL } from '~/app/ceph/nfs/models/nfs.fsal';
 import { ApiClient } from '~/app/shared/api/api-client';
 
 export interface Directory {
@@ -34,18 +34,23 @@ export class NfsService extends ApiClient {
 
   nfsFsal: NfsFSAbstractionLayer[] = [
     {
-      value: 'CEPH',
+      value: SUPPORTED_FSAL.CEPH,
       descr: $localize`CephFS`,
       disabled: false
     },
     {
-      value: 'RGW',
+      value: SUPPORTED_FSAL.RGW,
       descr: $localize`Object Gateway`,
       disabled: false
     }
   ];
 
-  nfsSquash = ['no_root_squash', 'root_id_squash', 'root_squash', 'all_squash'];
+  nfsSquash = {
+    no_root_squash: ['no_root_squash', 'noidsquash', 'none'],
+    root_id_squash: ['root_id_squash', 'rootidsquash', 'rootid'],
+    root_squash: ['root_squash', 'rootsquash', 'root'],
+    all_squash: ['all_squash', 'allsquash', 'all', 'allanonymous', 'all_anonymous']
+  };
 
   constructor(private http: HttpClient) {
     super();

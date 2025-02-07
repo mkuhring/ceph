@@ -94,15 +94,13 @@ public:
   bool ms_dispatch2(const ceph::ref_t<Message>& m);
 
   void background_init(Context *completion);
-  void shutdown();
-
-  void handle_signal(int signum);
 
   std::map<std::string, std::string> get_services() const;
 
   int call(
     std::string_view command,
     const cmdmap_t& cmdmap,
+    const bufferlist& inbl,
     Formatter *f,
     std::ostream& errss,
     ceph::buffer::list& out) override;

@@ -16,6 +16,10 @@
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
+#if FMT_VERSION >= 90000
+#include <fmt/ostream.h>
+#endif
+
 namespace ceph {
   class Formatter;
 }
@@ -56,7 +60,11 @@ struct uuid_d {
   }
 
   const char *bytes() const {
+#if BOOST_VERSION >= 108600
+    return (const char*)uuid.data();
+#else
     return (const char*)uuid.data;
+#endif
   }
 
   void encode(::ceph::buffer::list::contiguous_appender& p) const {
@@ -96,5 +104,8 @@ inline bool operator>(const uuid_d& l, const uuid_d& r) {
   return l.to_string() > r.to_string();
 }
 
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<uuid_d> : fmt::ostream_formatter {};
+#endif
 
 #endif

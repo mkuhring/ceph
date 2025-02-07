@@ -49,6 +49,7 @@ class RESTController(BaseController, skip_registry=True):
         'GET': Permission.READ,
         'POST': Permission.CREATE,
         'PUT': Permission.UPDATE,
+        'PATCH': Permission.UPDATE,
         'DELETE': Permission.DELETE
     }
 
@@ -60,7 +61,8 @@ class RESTController(BaseController, skip_registry=True):
         ('get', {'method': 'GET', 'resource': True, 'status': 200, 'version': APIVersion.DEFAULT}),
         ('delete', {'method': 'DELETE', 'resource': True, 'status': 204, 'version': APIVersion.DEFAULT}),  # noqa E501 #pylint: disable=line-too-long
         ('set', {'method': 'PUT', 'resource': True, 'status': 200, 'version': APIVersion.DEFAULT}),
-        ('singleton_set', {'method': 'PUT', 'resource': False, 'status': 200, 'version': APIVersion.DEFAULT})  # noqa E501 #pylint: disable=line-too-long
+        ('singleton_set', {'method': 'PUT', 'resource': False, 'status': 200, 'version': APIVersion.DEFAULT}),  # noqa E501 #pylint: disable=line-too-long
+        ('update', {'method': 'PATCH', 'resource': True, 'status': 200, 'version': APIVersion.DEFAULT})  # noqa E501 #pylint: disable=line-too-long
     ])
 
     @classmethod
@@ -70,6 +72,7 @@ class RESTController(BaseController, skip_registry=True):
         for k, v in cls._method_mapping.items():
             func = getattr(cls, k, None)
             while hasattr(func, "__wrapped__"):
+                assert func
                 func = func.__wrapped__
             if v['resource'] and func:
                 path_params = cls.get_path_param_names()
@@ -83,7 +86,7 @@ class RESTController(BaseController, skip_registry=True):
         result = super().endpoints()
         res_id_params = cls.infer_resource_id()
 
-        for _, func in inspect.getmembers(cls, predicate=callable):
+        for name, func in inspect.getmembers(cls, predicate=callable):
             endpoint_params = {
                 'no_resource_id_params': False,
                 'status': 200,
@@ -94,10 +97,9 @@ class RESTController(BaseController, skip_registry=True):
                 'sec_permissions': hasattr(func, '_security_permissions'),
                 'permission': None,
             }
-
-            if func.__name__ in cls._method_mapping:
+            if name in cls._method_mapping:
                 cls._update_endpoint_params_method_map(
-                    func, res_id_params, endpoint_params)
+                    func, res_id_params, endpoint_params, name=name)
 
             elif hasattr(func, "__collection_method__"):
                 cls._update_endpoint_params_collection_map(func, endpoint_params)
@@ -166,8 +168,8 @@ class RESTController(BaseController, skip_registry=True):
             endpoint_params['permission'] = cls._permission_map[endpoint_params['method']]
 
     @classmethod
-    def _update_endpoint_params_method_map(cls, func, res_id_params, endpoint_params):
-        meth = cls._method_mapping[func.__name__]  # type: dict
+    def _update_endpoint_params_method_map(cls, func, res_id_params, endpoint_params, name=None):
+        meth = cls._method_mapping[func.__name__ if not name else name]  # type: dict
 
         if meth['resource']:
             if not res_id_params:

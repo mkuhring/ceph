@@ -2,18 +2,34 @@
 
 set -e
 
+# increase the cache size
+sudo git config --global http.sslVerify false
+sudo git config --global http.postBuffer 1024MB # default is 1MB
+sudo git config --global http.maxRequestBuffer 100M # default is 10MB
+sudo git config --global core.compression 0
+
+# enable the debug logs for git clone
+export GIT_TRACE_PACKET=1
+export GIT_TRACE=1
+export GIT_CURL_VERBOSE=1
+
 # try it again if the clone is slow and the second time
 retried=false
 trap -- 'retry' EXIT
 retry() {
     rm -rf ceph
     # double the timeout value
-    timeout 3600 git clone git://git.ceph.com/ceph.git
+    timeout 3600 git clone https://git.ceph.com/ceph.git
 }
 rm -rf ceph
-timeout 1800 git clone git://git.ceph.com/ceph.git
+timeout 1800 git clone https://git.ceph.com/ceph.git
 trap - EXIT
 cd ceph
+
+# disable the debug logs for git clone
+export GIT_TRACE_PACKET=0
+export GIT_TRACE=0
+export GIT_CURL_VERBOSE=0
 
 versions=`seq 1 90`
 

@@ -1,15 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include "common/ceph_argparse.h"
-#include "messages/MPing.h"
-#include "messages/MCommand.h"
-#include "crimson/auth/DummyAuth.h"
-#include "crimson/common/log.h"
-#include "crimson/net/Connection.h"
-#include "crimson/net/Dispatcher.h"
-#include "crimson/net/Messenger.h"
-
 #include <map>
 #include <random>
 #include <fmt/format.h>
@@ -20,6 +11,18 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/with_timeout.hh>
+
+#include "common/ceph_argparse.h"
+#include "messages/MPing.h"
+#include "messages/MCommand.h"
+#include "crimson/auth/DummyAuth.h"
+#include "crimson/common/log.h"
+#include "crimson/net/Connection.h"
+#include "crimson/net/Dispatcher.h"
+#include "crimson/net/Messenger.h"
+#include "test/crimson/ctest_utils.h"
+
+#include <boost/random/uniform_int.hpp>
 
 using namespace std::chrono_literals;
 namespace bpo = boost::program_options;
@@ -49,11 +52,13 @@ struct Payload {
 };
 WRITE_CLASS_DENC(Payload)
 
-std::ostream& operator<<(std::ostream& out, const Payload &pl)
-{
-  return out << "reply=" << pl.who << " i = " << pl.seq;
-}
-
+template<>
+struct fmt::formatter<Payload> : fmt::formatter<std::string_view> {
+  template <typename FormatContext>
+  auto format(const Payload& pl, FormatContext& ctx) const {
+    return fmt::format_to(ctx.out(), "reply={} i={}", pl.who, pl.seq);
+  }
+};
 
 namespace {
 
@@ -93,7 +98,7 @@ class SyntheticWorkload;
 class SyntheticDispatcher final
     : public crimson::net::Dispatcher {
   public:
-  std::map<crimson::net::ConnectionRef, std::deque<payload_seq_t> > conn_sent;
+  std::map<crimson::net::Connection*, std::deque<payload_seq_t> > conn_sent;
   std::map<payload_seq_t, bufferlist> sent;
   unsigned index;
   SyntheticWorkload *workload;
@@ -103,9 +108,9 @@ class SyntheticDispatcher final
   }
 
   std::optional<seastar::future<>> ms_dispatch(crimson::net::ConnectionRef con,
-                                               MessageRef m) {
+                                               MessageRef m) final {
     if (verbose) {
-      logger().warn("{}: con = {}", __func__, con);
+      logger().warn("{}: con = {}", __func__, *con);
     }
     // MSG_COMMAND is used to disorganize regular message flow
     if (m->get_type() == MSG_COMMAND) {
@@ -116,17 +121,15 @@ class SyntheticDispatcher final
     auto p = m->get_data().cbegin();
     decode(pl, p);
     if (pl.who == Payload::PING) {
-      logger().info(" {} conn= {} {}", __func__,
-        m->get_connection(), pl);
-      return reply_message(m, pl);
+      logger().info(" {} conn= {} {}", __func__, *con, pl);
+      return reply_message(m, con, pl);
     } else {
       ceph_assert(pl.who == Payload::PONG);
       if (sent.count(pl.seq)) {
-        logger().info(" {} conn= {} {}", __func__,
-          m->get_connection(), pl);
-        ceph_assert(conn_sent[m->get_connection()].front() == pl.seq);
+        logger().info(" {} conn= {} {}", __func__, *con, pl);
+        ceph_assert(conn_sent[&*con].front() == pl.seq);
         ceph_assert(pl.data.contents_equal(sent[pl.seq]));
-        conn_sent[m->get_connection()].pop_front();
+        conn_sent[&*con].pop_front();
         sent.erase(pl.seq);
       }
 
@@ -134,21 +137,31 @@ class SyntheticDispatcher final
     }
   }
 
-  void ms_handle_accept(crimson::net::ConnectionRef conn) {
-    logger().info("{} - Connection:{}", __func__, conn);
+  void ms_handle_accept(
+      crimson::net::ConnectionRef conn,
+      seastar::shard_id prv_shard,
+      bool is_replace) final {
+    logger().info("{} - Connection:{}", __func__, *conn);
+    assert(prv_shard == seastar::this_shard_id());
   }
 
-  void ms_handle_connect(crimson::net::ConnectionRef conn) {
-    logger().info("{} - Connection:{}", __func__, conn);
+  void ms_handle_connect(
+      crimson::net::ConnectionRef conn,
+      seastar::shard_id prv_shard) final {
+    logger().info("{} - Connection:{}", __func__, *conn);
+    assert(prv_shard == seastar::this_shard_id());
   }
 
-  void ms_handle_reset(crimson::net::ConnectionRef con, bool is_replace);
+  void ms_handle_reset(crimson::net::ConnectionRef con, bool is_replace) final;
 
-  void ms_handle_remote_reset(crimson::net::ConnectionRef con) {
+  void ms_handle_remote_reset(crimson::net::ConnectionRef con) final {
     clear_pending(con);
   }
 
-  std::optional<seastar::future<>> reply_message(const MessageRef m, Payload& pl) {
+  std::optional<seastar::future<>> reply_message(
+      const MessageRef m,
+      crimson::net::ConnectionRef con,
+      Payload& pl) {
     pl.who = Payload::PONG;
     bufferlist bl;
     encode(pl, bl);
@@ -156,9 +169,9 @@ class SyntheticDispatcher final
     rm->set_data(bl);
     if (verbose) {
       logger().info("{} conn= {} reply i= {}",
-        __func__, m->get_connection(), pl.seq);
+        __func__, *con, pl.seq);
     }
-    return m->get_connection()->send(std::move(rm));
+    return con->send(std::move(rm));
   }
 
   seastar::future<> send_message_wrap(crimson::net::ConnectionRef con,
@@ -169,9 +182,9 @@ class SyntheticDispatcher final
     encode(pl, bl);
     m->set_data(bl);
     sent[pl.seq] = pl.data;
-    conn_sent[con].push_back(pl.seq);
+    conn_sent[&*con].push_back(pl.seq);
     logger().info("{} conn= {} send i= {}",
-      __func__, con, pl.seq);
+      __func__, *con, pl.seq);
 
     return con->send(std::move(m));
   }
@@ -181,25 +194,27 @@ class SyntheticDispatcher final
   }
 
   void clear_pending(crimson::net::ConnectionRef con) {
-    for (std::deque<uint64_t>::iterator it = conn_sent[con].begin();
-         it != conn_sent[con].end(); ++it)
+    for (std::deque<uint64_t>::iterator it = conn_sent[&*con].begin();
+         it != conn_sent[&*con].end(); ++it)
       sent.erase(*it);
-    conn_sent.erase(con);
+    conn_sent.erase(&*con);
   }
 
   void print() {
-    for (auto && [conn, list] : conn_sent) {
+    for (auto && [connptr, list] : conn_sent) {
       if (!list.empty()) {
         logger().info("{} {} wait {}", __func__,
-                      conn, list.size());
+                      (void*)connptr, list.size());
       }
     }
   }
 };
 
 class SyntheticWorkload {
+  // messengers must be freed after its connections
   std::set<crimson::net::MessengerRef> available_servers;
   std::set<crimson::net::MessengerRef> available_clients;
+
   crimson::net::SocketPolicy server_policy;
   crimson::net::SocketPolicy client_policy;
   std::map<crimson::net::ConnectionRef,
@@ -343,21 +358,20 @@ class SyntheticWorkload {
                           const uint64_t nonce,
                           const entity_addr_t& addr) {
      crimson::net::MessengerRef msgr =
-       crimson::net::Messenger::create(name, lname, nonce);
+       crimson::net::Messenger::create(
+           name, lname, nonce, true);
      msgr->set_default_policy(server_policy);
-     msgr->set_require_authorizer(false);
      msgr->set_auth_client(&dummy_auth);
      msgr->set_auth_server(&dummy_auth);
      available_servers.insert(msgr);
      return msgr->bind(entity_addrvec_t{addr}).safe_then(
          [this, msgr] {
        return msgr->start({&dispatcher});
-     }, crimson::net::Messenger::bind_ertr::all_same_way(
+     }, crimson::net::Messenger::bind_ertr::assert_all_func(
          [addr] (const std::error_code& e) {
        logger().error("{} test_messenger_thrash(): "
                       "there is another instance running at {}",
                        __func__, addr);
-       ceph_abort();
      }));
    }
 
@@ -365,7 +379,8 @@ class SyntheticWorkload {
                           const std::string& lname,
                           const uint64_t nonce) {
      crimson::net::MessengerRef msgr =
-       crimson::net::Messenger::create(name, lname, nonce);
+       crimson::net::Messenger::create(
+           name, lname, nonce, true);
      msgr->set_default_policy(client_policy);
      msgr->set_auth_client(&dummy_auth);
      msgr->set_auth_server(&dummy_auth);
@@ -411,7 +426,7 @@ class SyntheticWorkload {
          if (!p.first->get_default_policy().server &&
              !p.second->get_default_policy().server) {
              //verify that equal-to operator applies here
-           ceph_assert(conn->get_messenger() == p.first.get());
+           ceph_assert(p.first->owns_connection(*conn));
            crimson::net::ConnectionRef peer = p.second->connect(
              p.first->get_myaddr(), p.first->get_mytype());
            peer->mark_down();
@@ -434,15 +449,16 @@ class SyntheticWorkload {
    }
 
    seastar::future<> wait_for_done() {
-     int i = 0;
-     return seastar::do_until(
-       [this] { return !dispatcher.get_num_pending_msgs(); },
-       [this, &i]
-     {
-       if (i++ % 50 == 0){
-         print_internal_state(true);
-       }
-       return seastar::sleep(100ms);
+     return seastar::do_with(0, [this] (int &i) {
+       return seastar::do_until(
+         [this] { return !dispatcher.get_num_pending_msgs(); },
+         [this, &i] {
+           if (i++ % 50 == 0) {
+             print_internal_state(true);
+           }
+           return seastar::sleep(100ms);
+         }
+       );
      }).then([this] {
        return seastar::do_for_each(available_servers, [] (auto server) {
 	 if (verbose) {
@@ -452,8 +468,6 @@ class SyntheticWorkload {
          return server->shutdown();
        });
      }).then([this] {
-       available_servers.clear();
-     }).then([this] {
        return seastar::do_for_each(available_clients, [] (auto client) {
 	 if (verbose) {
            logger().info("client {} shutdown" , client->get_myaddrs());
@@ -461,8 +475,6 @@ class SyntheticWorkload {
          client->stop();
          return client->shutdown();
        });
-     }).then([this] {
-       available_clients.clear();
      });
    }
 
@@ -623,8 +635,11 @@ seastar::future<int> do_test(seastar::app_template& app)
                                               CEPH_ENTITY_TYPE_CLIENT,
                                               &cluster,
                                               &conf_file_list);
-  return crimson::common::sharded_conf().start(init_params.name, cluster)
-  .then([conf_file_list] {
+  return crimson::common::sharded_conf().start(
+    init_params.name, cluster
+  ).then([] {
+    return local_conf().start();
+  }).then([conf_file_list] {
     return local_conf().parse_config_files(conf_file_list);
   }).then([&app] {
     auto&& config = app.configuration();
@@ -650,7 +665,7 @@ seastar::future<int> do_test(seastar::app_template& app)
 
 int main(int argc, char** argv)
 {
-  seastar::app_template app;
+  seastar::app_template app{get_smp_opts_from_ctest()};
   app.add_options()
     ("verbose,v", bpo::value<bool>()->default_value(false),
      "chatty if true");

@@ -14,7 +14,7 @@ namespace crimson::os::seastore {
 
 using magic_t = uint64_t;
 
-struct device_spec_t{
+struct device_spec_t {
   magic_t magic = 0;
   device_type_t dtype = device_type_t::NONE;
   device_id_t id = DEVICE_ID_NULL;
@@ -45,6 +45,34 @@ struct device_config_t {
     denc(v.secondary_devices, p);
     DENC_FINISH(p);
   }
+  static device_config_t create_primary(
+    uuid_d new_osd_fsid,
+    device_id_t id,
+    device_type_t d_type,
+    secondary_device_set_t sds) {
+    return device_config_t{
+             true,
+             device_spec_t{
+               (magic_t)std::rand(),
+		d_type,
+		id},
+             seastore_meta_t{new_osd_fsid},
+             sds};
+   }
+  static device_config_t create_secondary(
+    uuid_d new_osd_fsid,
+    device_id_t id,
+    device_type_t d_type,
+    magic_t magic) {
+    return device_config_t{
+             false,
+             device_spec_t{
+               magic,
+               d_type,
+               id},
+             seastore_meta_t{new_osd_fsid},
+             secondary_device_set_t()};
+  }
 };
 
 std::ostream& operator<<(std::ostream&, const device_config_t&);
@@ -58,22 +86,21 @@ using DeviceRef = std::unique_ptr<Device>;
  * Represents a general device regardless of the underlying medium.
  */
 class Device {
+// interfaces used by device
 public:
   virtual ~Device() {}
 
-  virtual device_id_t get_device_id() const = 0;
+  virtual seastar::future<> start() {
+    return seastar::now();
+  }
 
-  virtual magic_t get_magic() const = 0;
-
-  virtual device_type_t get_device_type() const = 0;
-
-  virtual const seastore_meta_t &get_meta() const = 0;
-
-  virtual seastore_off_t get_block_size() const = 0;
-
-  virtual std::size_t get_size() const = 0;
-
-  virtual secondary_device_set_t& get_secondary_devices() = 0;
+  virtual seastar::future<> stop() {
+    return seastar::now();
+  }
+  // called on the shard to get this shard device;
+  virtual Device& get_sharded_device() {
+    return *this;
+  }
 
   using access_ertr = crimson::errorator<
     crimson::ct_error::input_output_error,
@@ -87,6 +114,32 @@ public:
   using mount_ertr = access_ertr;
   using mount_ret = access_ertr::future<>;
   virtual mount_ret mount() = 0;
+
+  static seastar::future<DeviceRef> make_device(
+    const std::string &device,
+    device_type_t dtype);
+
+// interfaces used by each device shard
+public:
+  virtual device_id_t get_device_id() const = 0;
+
+  virtual magic_t get_magic() const = 0;
+
+  virtual device_type_t get_device_type() const = 0;
+
+  virtual backend_type_t get_backend_type() const = 0;
+
+  virtual const seastore_meta_t &get_meta() const = 0;
+
+  virtual extent_len_t get_block_size() const = 0;
+
+  virtual std::size_t get_available_size() const = 0;
+
+  virtual secondary_device_set_t& get_secondary_devices() = 0;
+
+  virtual bool is_end_to_end_data_protection() const {
+    return false;
+  }
 
   using close_ertr = crimson::errorator<
     crimson::ct_error::input_output_error>;
@@ -113,11 +166,14 @@ public:
       return read_ertr::make_ready_future<bufferptr>(std::move(*ptrref));
     });
   }
-
-  static seastar::future<DeviceRef> make_device(const std::string &device);
 };
 
 }
 
 WRITE_CLASS_DENC_BOUNDED(crimson::os::seastore::device_spec_t)
 WRITE_CLASS_DENC(crimson::os::seastore::device_config_t)
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::os::seastore::device_config_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::device_spec_t> : fmt::ostream_formatter {};
+#endif

@@ -40,7 +40,8 @@ target_link_libraries(
 
 add_executable(unittest-object-data-handler
   test_object_data_handler.cc
-  ../gtest_seastar.cc)
+  ../gtest_seastar.cc
+  ${PROJECT_SOURCE_DIR}/src/crimson/osd/lsan_suppressions.cc)
 add_ceph_unittest(unittest-object-data-handler
   --memory 256M --smp 1)
 target_link_libraries(
@@ -52,7 +53,8 @@ target_link_libraries(
 
 add_executable(unittest-collection-manager
   test_collection_manager.cc
-  ../gtest_seastar.cc)
+  ../gtest_seastar.cc
+  ${PROJECT_SOURCE_DIR}/src/crimson/osd/lsan_suppressions.cc)
 add_ceph_test(unittest-collection-manager
   unittest-collection-manager --memory 256M --smp 1)
 target_link_libraries(
@@ -109,6 +111,16 @@ add_ceph_test(unittest-seastore-cbjournal
   unittest-seastore-cbjournal --memory 256M --smp 1)
 target_link_libraries(
   unittest-seastore-cbjournal
+  crimson::gtest
+  crimson-seastore
+  aio)
+
+add_executable(unittest-seastore-extent-allocator
+  test_extent_allocator.cc)
+add_ceph_test(unittest-seastore-extent-allocator
+  unittest-seastore-extent-allocator --memory 256M --smp 1)
+target_link_libraries(
+  unittest-seastore-extent-allocator
   crimson::gtest
   crimson-seastore
   aio)

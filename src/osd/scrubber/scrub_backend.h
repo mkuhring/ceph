@@ -47,10 +47,9 @@
 
 #include "common/LogClient.h"
 #include "osd/OSDMap.h"
-#include "common/scrub_types.h"
 #include "osd/osd_types_fmt.h"
-
 #include "osd/scrubber_common.h"
+#include "osd/SnapMapReaderI.h"
 
 struct ScrubMap;
 
@@ -99,42 +98,12 @@ struct ScrubBeListener {
   virtual ~ScrubBeListener() = default;
 };
 
-
-/*
- * snaps-related aux structures:
- * the scrub-backend scans the snaps associated with each scrubbed object, and
- * fixes corrupted snap-sets.
- * The actual access to the PG's snap_mapper, and the actual I/O transactions,
- * are performed by the main PgScrubber object.
- * the following aux structures are used to facilitate the required exchanges:
- * - pre-fix snap-sets are accessed by the scrub-backend, and:
- * - a list of fix-orders (either insert or replace operations) are returned
- */
-
-struct SnapMapperAccessor {
-  virtual int get_snaps(const hobject_t& hoid,
-                        std::set<snapid_t>* snaps_set) const = 0;
-  virtual ~SnapMapperAccessor() = default;
-};
-
-enum class snap_mapper_op_t {
-  add,
-  update,
-};
-
-struct snap_mapper_fix_t {
-  snap_mapper_op_t op;
-  hobject_t hoid;
-  std::set<snapid_t> snaps;
-  std::set<snapid_t> wrong_snaps;  // only collected & returned for logging sake
-};
-
-// and - as the main scrub-backend entry point - scrub_compare_maps() - must
+// As the main scrub-backend entry point - scrub_compare_maps() - must
 // be able to return both a list of snap fixes and a list of inconsistent
 // objects:
 struct objs_fix_list_t {
   inconsistent_objs_t inconsistent_objs;
-  std::vector<snap_mapper_fix_t> snap_fix_list;
+  std::vector<Scrub::snap_mapper_fix_t> snap_fix_list;
 };
 
 /**
@@ -195,9 +164,10 @@ struct shard_as_auth_t {
   // other in/out arguments) via this struct
 };
 
+namespace fmt {
 // the format specifier {D} is used to request debug output
 template <>
-struct fmt::formatter<shard_as_auth_t> {
+struct formatter<shard_as_auth_t> {
   template <typename ParseContext>
   constexpr auto parse(ParseContext& ctx)
   {
@@ -208,26 +178,26 @@ struct fmt::formatter<shard_as_auth_t> {
     return it;
   }
   template <typename FormatContext>
-  auto format(shard_as_auth_t const& as_auth, FormatContext& ctx)
+  auto format(shard_as_auth_t const& as_auth, FormatContext& ctx) const
   {
     if (debug_log) {
       // note: 'if' chain, as hard to consistently (on all compilers) avoid some
       // warnings for a switch plus multiple return paths
       if (as_auth.possible_auth == shard_as_auth_t::usable_t::not_usable) {
-        return format_to(ctx.out(),
-                         "{{shard-not-usable:{}}}",
-                         as_auth.error_text);
+        return fmt::format_to(ctx.out(),
+                              "{{shard-not-usable:{}}}",
+                              as_auth.error_text);
       }
       if (as_auth.possible_auth == shard_as_auth_t::usable_t::not_found) {
-        return format_to(ctx.out(), "{{shard-not-found}}");
+        return fmt::format_to(ctx.out(), "{{shard-not-found}}");
       }
-      return format_to(ctx.out(),
-                       "{{shard-usable: soid:{} {{txt:{}}} }}",
-                       as_auth.oi.soid,
-                       as_auth.error_text);
+      return fmt::format_to(ctx.out(),
+                            "{{shard-usable: soid:{} {{txt:{}}} }}",
+                            as_auth.oi.soid,
+                            as_auth.error_text);
 
     } else {
-      return format_to(
+      return fmt::format_to(
         ctx.out(),
         "usable:{} soid:{} {{txt:{}}}",
         (as_auth.possible_auth == shard_as_auth_t::usable_t::usable) ? "yes"
@@ -239,6 +209,7 @@ struct fmt::formatter<shard_as_auth_t> {
 
   bool debug_log{false};
 };
+} // namespace fmt
 
 struct auth_selection_t {
   shard_to_scrubmap_t::iterator auth;  ///< an iter into one of this_chunk->maps
@@ -260,7 +231,7 @@ struct fmt::formatter<auth_selection_t> {
   }
 
   template <typename FormatContext>
-  auto format(auth_selection_t const& aus, FormatContext& ctx)
+  auto format(auth_selection_t const& aus, FormatContext& ctx) const
   {
     return fmt::format_to(ctx.out(),
                           " {{AU-S: {}->{:x} OI({:x}:{}) {} dm:{}}} ",
@@ -352,11 +323,11 @@ class ScrubBackend {
    */
   void update_repair_status(bool should_repair);
 
-  std::vector<snap_mapper_fix_t> replica_clean_meta(
+  std::vector<Scrub::snap_mapper_fix_t> replica_clean_meta(
     ScrubMap& smap,
     bool max_reached,
     const hobject_t& start,
-    SnapMapperAccessor& snaps_getter);
+    Scrub::SnapMapReaderI& snaps_getter);
 
   /**
    * decode the arriving MOSDRepScrubMap message, placing the replica's
@@ -367,7 +338,7 @@ class ScrubBackend {
   void decode_received_map(pg_shard_t from, const MOSDRepScrubMap& msg);
 
   objs_fix_list_t scrub_compare_maps(bool max_reached,
-                                     SnapMapperAccessor& snaps_getter);
+				     Scrub::SnapMapReaderI& snaps_getter);
 
   int scrub_process_inconsistent();
 
@@ -531,29 +502,31 @@ class ScrubBackend {
   /**
    * returns a list of snaps "fix orders"
    */
-  std::vector<snap_mapper_fix_t> scan_snaps(
+  std::vector<Scrub::snap_mapper_fix_t> scan_snaps(
     ScrubMap& smap,
-    SnapMapperAccessor& snaps_getter);
+    Scrub::SnapMapReaderI& snaps_getter);
 
   /**
    * an aux used by scan_snaps(), possibly returning a fix-order
    * for a specific hobject.
    */
-  std::optional<snap_mapper_fix_t> scan_object_snaps(
+  std::optional<Scrub::snap_mapper_fix_t> scan_object_snaps(
     const hobject_t& hoid,
     const SnapSet& snapset,
-    SnapMapperAccessor& snaps_getter);
+    Scrub::SnapMapReaderI& snaps_getter);
 
   // accessing the PG backend for this translation service
   uint64_t logical_to_ondisk_size(uint64_t logical_size) const;
 };
 
+namespace fmt {
+
 template <>
-struct fmt::formatter<data_omap_digests_t> {
+struct formatter<data_omap_digests_t> {
   constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
 
   template <typename FormatContext>
-  auto format(const data_omap_digests_t& dg, FormatContext& ctx)
+  auto format(const data_omap_digests_t& dg, FormatContext& ctx) const
   {
     // can't use value_or() due to different output types
     if (std::get<0>(dg).has_value()) {
@@ -570,12 +543,12 @@ struct fmt::formatter<data_omap_digests_t> {
 };
 
 template <>
-struct fmt::formatter<std::pair<hobject_t, data_omap_digests_t>> {
+struct formatter<std::pair<hobject_t, data_omap_digests_t>> {
   constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
 
   template <typename FormatContext>
   auto format(const std::pair<hobject_t, data_omap_digests_t>& x,
-	      FormatContext& ctx)
+	      FormatContext& ctx) const
   {
     return fmt::format_to(ctx.out(),
 			  "{{ {} - {} }}",
@@ -583,3 +556,4 @@ struct fmt::formatter<std::pair<hobject_t, data_omap_digests_t>> {
 			  std::get<1>(x));
   }
 };
+} // namespace fmt

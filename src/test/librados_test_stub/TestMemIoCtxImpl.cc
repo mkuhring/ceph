@@ -6,6 +6,7 @@
 #include "common/Clock.h"
 #include "include/err.h"
 #include <functional>
+#include <shared_mutex> // for std::shared_lock
 #include <boost/algorithm/string/predicate.hpp>
 #include <errno.h>
 #include <include/compat.h>
@@ -479,7 +480,7 @@ int TestMemIoCtxImpl::selfmanaged_snap_rollback(const std::string& oid,
   for (TestMemCluster::FileSnapshots::reverse_iterator it = snaps.rbegin();
       it != snaps.rend(); ++it) {
     TestMemCluster::SharedFile file = *it;
-    if (file->snap_id < get_snap_read()) {
+    if (file->snap_id < snapid) {
       if (versions == 0) {
         // already at the snapshot version
         return 0;

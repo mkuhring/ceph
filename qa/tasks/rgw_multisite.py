@@ -10,7 +10,6 @@ from tasks.util.rgw import rgwadmin, wait_for_radosgw
 from tasks.util.rados import create_ec_pool, create_replicated_pool
 from tasks.rgw_multi import multisite
 from tasks.rgw_multi.zone_rados import RadosZone as RadosZone
-from tasks.rgw_multi.zone_ps import PSZone as PSZone
 
 from teuthology.orchestra import run
 from teuthology import misc
@@ -33,7 +32,6 @@ class RGWMultisite(Task):
 
     * 'is_master' is passed on the command line as --master
     * 'is_default' is passed on the command line as --default
-    * 'is_pubsub' is used to create a zone with tier-type=pubsub
     * 'endpoints' given as client names are replaced with actual endpoints
 
             zonegroups:
@@ -79,9 +77,6 @@ class RGWMultisite(Task):
                   - name: test-zone2
                     is_default: true
                     endpoints: [c2.client.0]
-                  - name: test-zone3
-                    is_pubsub: true
-                    endpoints: [c1.client.1]
 
     """
     def __init__(self, ctx, config):
@@ -144,7 +139,10 @@ class RGWMultisite(Task):
 
                 if cluster != cluster1: # already created on master cluster
                     log.info('pulling realm configuration to %s', cluster.name)
-                    realm.pull(cluster, master_zone.gateways[0], creds)
+
+                    is_default = self.config['realm'].get('is_default', False)
+                    args = ['--default'] if is_default else []
+                    realm.pull(cluster, master_zone.gateways[0], creds, args)
 
                 # use the first zone's cluster to create the zonegroup
                 if not zonegroup:
@@ -363,6 +361,8 @@ def create_zonegroup(cluster, gateways, period, config):
     if endpoints:
         # replace client names with their gateway endpoints
         config['endpoints'] = extract_gateway_endpoints(gateways, endpoints)
+    if not config.get('api_name'): # otherwise it will be set to an empty string
+        config['api_name'] = config['name']
     zonegroup = multisite.ZoneGroup(config['name'], period)
     # `zonegroup set` needs --default on command line, and 'is_master' in json
     args = is_default_arg(config)
@@ -373,10 +373,7 @@ def create_zonegroup(cluster, gateways, period, config):
 def create_zone(ctx, cluster, gateways, creds, zonegroup, config):
     """ create a zone with the given configuration """
     zone = multisite.Zone(config['name'], zonegroup, cluster)
-    if config.pop('is_pubsub', False):
-        zone = PSZone(config['name'], zonegroup, cluster)
-    else:
-        zone = RadosZone(config['name'], zonegroup, cluster)
+    zone = RadosZone(config['name'], zonegroup, cluster)
 
     # collect Gateways for the zone's endpoints
     endpoints = config.get('endpoints')

@@ -1,6 +1,6 @@
 import cherrypy
+import yaml
 from collections import defaultdict
-from distutils.version import StrictVersion
 import json
 import math
 import os
@@ -8,13 +8,15 @@ import re
 import threading
 import time
 import enum
+from collections import namedtuple
+import tempfile
+
 from mgr_module import CLIReadCommand, MgrModule, MgrStandbyModule, PG_STATES, Option, ServiceInfoT, HandleCommandResult, CLIWriteCommand
 from mgr_util import get_default_addr, profile_method, build_url
+from orchestrator import OrchestratorClientMixin, raise_if_exception, OrchestratorError
 from rbd import RBD
-from collections import namedtuple
-import yaml
 
-from typing import DefaultDict, Optional, Dict, Any, Set, cast, Tuple, Union, List, Callable
+from typing import DefaultDict, Optional, Dict, Any, Set, cast, Tuple, Union, List, Callable, IO
 
 LabelValues = Tuple[str, ...]
 Number = Union[int, float]
@@ -25,20 +27,6 @@ MetricValue = Dict[LabelValues, Number]
 # for Prometheus exporter port registry
 
 DEFAULT_PORT = 9283
-
-# When the CherryPy server in 3.2.2 (and later) starts it attempts to verify
-# that the ports its listening on are in fact bound. When using the any address
-# "::" it tries both ipv4 and ipv6, and in some environments (e.g. kubernetes)
-# ipv6 isn't yet configured / supported and CherryPy throws an uncaught
-# exception.
-if cherrypy is not None:
-    v = StrictVersion(cherrypy.__version__)
-    # the issue was fixed in 3.2.3. it's present in 3.2.2 (current version on
-    # centos:7) and back to at least 3.0.0.
-    if StrictVersion("3.1.2") <= v < StrictVersion("3.2.3"):
-        # https://github.com/cherrypy/cherrypy/issues/1100
-        from cherrypy.process import servers
-        servers.wait_for_occupied_port = lambda host, port: None
 
 
 # cherrypy likes to sys.exit on error.  don't let it take us down too!
@@ -68,6 +56,8 @@ def health_status_to_number(status: str) -> int:
 
 
 DF_CLUSTER = ['total_bytes', 'total_used_bytes', 'total_used_raw_bytes']
+
+OSD_BLOCKLIST = ['osd_blocklist_count']
 
 DF_POOL = ['max_avail', 'avail_raw', 'stored', 'stored_raw', 'objects', 'dirty',
            'quota_bytes', 'quota_objects', 'rd', 'rd_bytes', 'wr', 'wr_bytes',
@@ -323,6 +313,7 @@ class Metric(object):
 
     def str_expfmt(self) -> str:
 
+        # Must be kept in sync with promethize() in src/exporter/util.cc
         def promethize(path: str) -> str:
             ''' replace illegal metric name characters '''
             result = re.sub(r'[./\s]|::', '_', path).replace('+', '_plus')
@@ -543,7 +534,7 @@ class MetricCollectionThread(threading.Thread):
         self.event.set()
 
 
-class Module(MgrModule):
+class Module(MgrModule, OrchestratorClientMixin):
     MODULE_OPTIONS = [
         Option(
             'server_addr',
@@ -594,6 +585,14 @@ class Module(MgrModule):
             min=400,
             max=599,
             runtime=True
+        ),
+        Option(
+            name='exclude_perf_counters',
+            type='bool',
+            default=True,
+            desc='Do not include perf-counters in the metrics output',
+            long_desc='Gathering perf-counters from a single Prometheus exporter can degrade ceph-mgr performance, especially in large clusters. Instead, Ceph-exporter daemons are now used by default for perf-counter gathering. This should only be disabled when no ceph-exporters are deployed.',
+            runtime=True
         )
     ]
 
@@ -602,6 +601,8 @@ class Module(MgrModule):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super(Module, self).__init__(*args, **kwargs)
+        self.key_file: IO[bytes]
+        self.cert_file: IO[bytes]
         self.metrics = self._setup_static_metrics()
         self.shutdown_event = threading.Event()
         self.collect_lock = threading.Lock()
@@ -623,9 +624,9 @@ class Module(MgrModule):
                 'read_bytes': {'type': self.PERFCOUNTER_COUNTER,
                                'desc': 'RBD image bytes read'},
                 'write_latency': {'type': self.PERFCOUNTER_LONGRUNAVG,
-                                  'desc': 'RBD image writes latency (msec)'},
+                                  'desc': 'RBD image writes latency (nsec)'},
                 'read_latency': {'type': self.PERFCOUNTER_LONGRUNAVG,
-                                 'desc': 'RBD image reads latency (msec)'},
+                                 'desc': 'RBD image reads latency (nsec)'},
             },
         }  # type: Dict[str, Any]
         global _global_instance
@@ -748,6 +749,20 @@ class Module(MgrModule):
             HEALTHCHECK_DETAIL
         )
 
+        metrics['pool_objects_repaired'] = Metric(
+            'counter',
+            'pool_objects_repaired',
+            'Number of objects repaired in a pool',
+            ('pool_id',)
+        )
+
+        metrics['daemon_health_metrics'] = Metric(
+            'gauge',
+            'daemon_health_metrics',
+            'Health metrics for Ceph daemons',
+            ('type', 'ceph_daemon',)
+        )
+
         for flag in OSD_FLAGS:
             path = 'osd_flag_{}'.format(flag)
             metrics[path] = Metric(
@@ -809,6 +824,13 @@ class Module(MgrModule):
                 'DF pool {}'.format(state),
                 ('pool_id',)
             )
+        for state in OSD_BLOCKLIST:
+            path = 'cluster_{}'.format(state)
+            metrics[path] = Metric(
+                'gauge',
+                path,
+                'OSD Blocklist Count {}'.format(state),
+            )
         for state in NUM_OBJECTS:
             path = 'num_objects_{}'.format(state)
             metrics[path] = Metric(
@@ -826,6 +848,14 @@ class Module(MgrModule):
             )
 
         return metrics
+
+    def orch_is_available(self) -> bool:
+        try:
+            return self.available()[0]
+        except (RuntimeError, OrchestratorError, ImportError):
+            # import error could happend during startup in case
+            # orchestrator has not been loaded yet by the mgr
+            return False
 
     def get_server_addr(self) -> str:
         """
@@ -846,9 +876,9 @@ class Module(MgrModule):
         self.log.info('Restarting engine...')
         cherrypy.engine.stop()
         cherrypy.server.httpserver = None
+        server_addr = cast(str, self.get_localized_module_option('server_addr', get_default_addr()))
         server_port = cast(int, self.get_localized_module_option('server_port', DEFAULT_PORT))
-        self.set_uri(build_url(scheme='http', host=self.get_server_addr(), port=server_port, path='/'))
-        cherrypy.config.update({'server.socket_port': server_port})
+        self.configure(server_addr, server_port)
         cherrypy.engine.start()
         self.log.info('Engine started.')
 
@@ -929,7 +959,8 @@ class Module(MgrModule):
         for stat in DF_CLUSTER:
             self.metrics['cluster_{}'.format(stat)].set(df['stats'][stat])
             for device_class in df['stats_by_class']:
-                self.metrics['cluster_by_class_{}'.format(stat)].set(df['stats_by_class'][device_class][stat], (device_class,))
+                self.metrics['cluster_by_class_{}'.format(stat)].set(
+                    df['stats_by_class'][device_class][stat], (device_class,))
 
         for pool in df['pools']:
             for stat in DF_POOL:
@@ -937,6 +968,17 @@ class Module(MgrModule):
                     pool['stats'][stat],
                     (pool['id'],)
                 )
+
+    @profile_method()
+    def get_osd_blocklisted_entries(self) -> None:
+        r = self.mon_command({
+            'prefix': 'osd blocklist ls',
+            'format': 'json'
+        })
+        blocklist_entries = r[2].split(' ')
+        blocklist_count = blocklist_entries[1]
+        for stat in OSD_BLOCKLIST:
+            self.metrics['cluster_{}'.format(stat)].set(int(blocklist_count))
 
     @profile_method()
     def get_fs(self) -> None:
@@ -1042,7 +1084,9 @@ class Module(MgrModule):
         pg_summary = self.get('pg_summary')
 
         for pool in pg_summary['by_pool']:
-            num_by_state = defaultdict(int)  # type: DefaultDict[str, int]
+            num_by_state: DefaultDict[str, int] = defaultdict(int)
+            for state in PG_STATES:
+                num_by_state[state] = 0
 
             for state_name, count in pg_summary['by_pool'][pool].items():
                 for state in state_name.split('+'):
@@ -1071,8 +1115,9 @@ class Module(MgrModule):
         for server in self.list_servers():
             host = cast(str, server.get('hostname', ''))
             for service in cast(List[ServiceInfoT], server.get('services', [])):
-                ret.update({(service['id'], service['type']): (
-                    host, service['ceph_version'], service.get('name', ''))})
+                ret.update({(service['id'], service['type']): (host,
+                                                               service.get('ceph_version', 'unknown'),
+                                                               service.get('name', ''))})
         return ret
 
     @profile_method()
@@ -1232,9 +1277,24 @@ class Module(MgrModule):
             )
 
         # Populate other servers metadata
+        # If orchestrator is available and ceph-exporter is running modify rgw instance id
+        # to match the one from exporter
+        modify_instance_id = self.orch_is_available() and self.get_module_option('exclude_perf_counters')
+        if modify_instance_id:
+            daemons = raise_if_exception(self.list_daemons(daemon_type='rgw'))
+            for daemon in daemons:
+                if daemon.daemon_id and '.' in daemon.daemon_id:
+                    instance_id = daemon.daemon_id.split(".")[2]
+                else:
+                    instance_id = daemon.daemon_id if daemon.daemon_id else ""
+                self.metrics['rgw_metadata'].set(1,
+                                                 (f"{daemon.daemon_type}.{daemon.daemon_id}",
+                                                  str(daemon.hostname),
+                                                  str(daemon.version),
+                                                  instance_id))
         for key, value in servers.items():
             service_id, service_type = key
-            if service_type == 'rgw':
+            if service_type == 'rgw' and not modify_instance_id:
                 hostname, version, name = value
                 self.metrics['rgw_metadata'].set(
                     1,
@@ -1281,7 +1341,10 @@ class Module(MgrModule):
         # stats are collected for every namespace in the pool. The wildcard
         # '*' can be used to indicate all pools or namespaces
         pools_string = cast(str, self.get_localized_module_option('rbd_stats_pools'))
-        pool_keys = []
+        pool_keys = set()
+        osd_map = self.get('osd_map')
+        rbd_pools = [pool['pool_name'] for pool in osd_map['pools']
+                     if 'rbd' in pool.get('application_metadata', {})]
         for x in re.split(r'[\s,]+', pools_string):
             if not x:
                 continue
@@ -1294,13 +1357,11 @@ class Module(MgrModule):
 
             if pool_name == "*":
                 # collect for all pools
-                osd_map = self.get('osd_map')
-                for pool in osd_map['pools']:
-                    if 'rbd' not in pool.get('application_metadata', {}):
-                        continue
-                    pool_keys.append((pool['pool_name'], namespace_name))
+                for pool in rbd_pools:
+                    pool_keys.add((pool, namespace_name))
             else:
-                pool_keys.append((pool_name, namespace_name))
+                if pool_name in rbd_pools:
+                    pool_keys.add((pool_name, namespace_name))  # avoids adding deleted pool
 
         pools = {}  # type: Dict[str, Set[str]]
         for pool_key in pool_keys:
@@ -1562,24 +1623,26 @@ class Module(MgrModule):
                 cast(MetricCounter, sum_metric).add(duration, (method_name,))
                 cast(MetricCounter, count_metric).add(1, (method_name,))
 
-    @profile_method(True)
-    def collect(self) -> str:
-        # Clear the metrics before scraping
-        for k in self.metrics.keys():
-            self.metrics[k].clear()
+    def get_pool_repaired_objects(self) -> None:
+        dump = self.get('pg_dump')
+        for stats in dump['pool_stats']:
+            path = 'pool_objects_repaired'
+            self.metrics[path].set(stats['stat_sum']['num_objects_repaired'],
+                                   labelvalues=(stats['poolid'],))
 
-        self.get_health()
-        self.get_df()
-        self.get_pool_stats()
-        self.get_fs()
-        self.get_osd_stats()
-        self.get_quorum_status()
-        self.get_mgr_status()
-        self.get_metadata_and_osd_status()
-        self.get_pg_status()
-        self.get_num_objects()
+    def get_all_daemon_health_metrics(self) -> None:
+        daemon_metrics = self.get_daemon_health_metrics()
+        for daemon_name, health_metrics in daemon_metrics.items():
+            for health_metric in health_metrics:
+                path = 'daemon_health_metrics'
+                self.metrics[path].set(health_metric['value'], labelvalues=(
+                    health_metric['type'], daemon_name,))
 
-        for daemon, counters in self.get_all_perf_counters().items():
+    def get_perf_counters(self) -> None:
+        """
+        Get the perf counters for all daemons
+        """
+        for daemon, counters in self.get_unlabeled_perf_counters().items():
             for path, counter_info in counters.items():
                 # Skip histograms, they are represented by long running avgs
                 stattype = self._stattype_to_str(counter_info['type'])
@@ -1605,7 +1668,6 @@ class Module(MgrModule):
                             label_names,
                         )
                     self.metrics[_path].set(value, labels)
-
                     _path = path + '_count'
                     if _path not in self.metrics:
                         self.metrics[_path] = Metric(
@@ -1624,8 +1686,30 @@ class Module(MgrModule):
                             label_names,
                         )
                     self.metrics[path].set(value, labels)
-
         self.add_fixed_name_metrics()
+
+    @profile_method(True)
+    def collect(self) -> str:
+        # Clear the metrics before scraping
+        for k in self.metrics.keys():
+            self.metrics[k].clear()
+
+        self.get_health()
+        self.get_df()
+        self.get_osd_blocklisted_entries()
+        self.get_pool_stats()
+        self.get_fs()
+        self.get_osd_stats()
+        self.get_quorum_status()
+        self.get_mgr_status()
+        self.get_metadata_and_osd_status()
+        self.get_pg_status()
+        self.get_pool_repaired_objects()
+        self.get_num_objects()
+        self.get_all_daemon_health_metrics()
+
+        if not self.get_module_option('exclude_perf_counters'):
+            self.get_perf_counters()
         self.get_rbd_stats()
 
         self.get_collect_time_metrics()
@@ -1663,6 +1747,75 @@ class Module(MgrModule):
     def self_test(self) -> None:
         self.collect()
         self.get_file_sd_config()
+
+    def configure(self, server_addr: str, server_port: int) -> None:
+        # TODO(redo): this new check is hacky, we should provide an explit cmd
+        # from cephadm to get/check the security status
+
+        # if cephadm is configured with security then TLS must be used
+        cmd = {'prefix': 'orch prometheus get-credentials'}
+        ret, out, _ = self.mon_command(cmd)
+        if ret == 0 and out is not None:
+            access_info = json.loads(out)
+            if access_info:
+                try:
+                    self.setup_tls_using_cephadm(server_addr, server_port)
+                    return
+                except Exception as e:
+                    self.log.exception(f'Failed to setup cephadm based secure monitoring stack: {e}\n',
+                                       'Falling back to default configuration')
+
+        # In any error fallback to plain http mode
+        self.setup_default_config(server_addr, server_port)
+
+    def setup_default_config(self, server_addr: str, server_port: int) -> None:
+        cherrypy.config.update({
+            'server.socket_host': server_addr,
+            'server.socket_port': server_port,
+            'engine.autoreload.on': False,
+            'server.ssl_module': None,
+            'server.ssl_certificate': None,
+            'server.ssl_private_key': None,
+        })
+        # Publish the URI that others may use to access the service we're about to start serving
+        self.set_uri(build_url(scheme='http', host=self.get_server_addr(),
+                     port=server_port, path='/'))
+
+    def setup_tls_using_cephadm(self, server_addr: str, server_port: int) -> None:
+        from mgr_util import verify_tls_files
+        cmd = {'prefix': 'orch certmgr generate-certificates',
+               'module_name': 'prometheus',
+               'format': 'json'}
+        ret, out, err = self.mon_command(cmd)
+        if ret != 0:
+            self.log.error(f'mon command to generate-certificates failed: {err}')
+            return
+        elif out is None:
+            self.log.error('mon command to generate-certificates failed to generate certificates')
+            return
+
+        cert_key = json.loads(out)
+        self.cert_file = tempfile.NamedTemporaryFile()
+        self.cert_file.write(cert_key['cert'].encode('utf-8'))
+        self.cert_file.flush()  # cert_tmp must not be gc'ed
+        self.key_file = tempfile.NamedTemporaryFile()
+        self.key_file.write(cert_key['key'].encode('utf-8'))
+        self.key_file.flush()  # pkey_tmp must not be gc'ed
+
+        verify_tls_files(self.cert_file.name, self.key_file.name)
+        cert_file_path, key_file_path = self.cert_file.name, self.key_file.name
+
+        cherrypy.config.update({
+            'server.socket_host': server_addr,
+            'server.socket_port': server_port,
+            'engine.autoreload.on': False,
+            'server.ssl_module': 'builtin',
+            'server.ssl_certificate': cert_file_path,
+            'server.ssl_private_key': key_file_path,
+        })
+        # Publish the URI that others may use to access the service we're about to start serving
+        self.set_uri(build_url(scheme='https', host=self.get_server_addr(),
+                     port=server_port, path='/'))
 
     def serve(self) -> None:
 
@@ -1744,10 +1897,8 @@ class Module(MgrModule):
                                              self.STALE_CACHE_RETURN]:
             self.stale_cache_strategy = self.STALE_CACHE_FAIL
 
-        server_addr = cast(str, self.get_localized_module_option(
-            'server_addr', get_default_addr()))
-        server_port = cast(int, self.get_localized_module_option(
-            'server_port', DEFAULT_PORT))
+        server_addr = cast(str, self.get_localized_module_option('server_addr', get_default_addr()))
+        server_port = cast(int, self.get_localized_module_option('server_port', DEFAULT_PORT))
         self.log.info(
             "server_addr: %s server_port: %s" %
             (server_addr, server_port)
@@ -1760,19 +1911,13 @@ class Module(MgrModule):
         else:
             self.log.info('Cache disabled')
 
-        cherrypy.config.update({
-            'server.socket_host': server_addr,
-            'server.socket_port': server_port,
-            'engine.autoreload.on': False
-        })
-        # Publish the URI that others may use to access the service we're
-        # about to start serving
-        self.set_uri(build_url(scheme='http', host=self.get_server_addr(), port=server_port, path='/'))
+        self.configure(server_addr, server_port)
 
         cherrypy.tree.mount(Root(), "/")
         self.log.info('Starting engine...')
         cherrypy.engine.start()
         self.log.info('Engine started.')
+
         # wait for the shutdown event
         self.shutdown_event.wait()
         self.shutdown_event.clear()

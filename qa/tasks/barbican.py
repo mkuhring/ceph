@@ -88,6 +88,14 @@ def run_in_barbican_venv(ctx, client, args):
                          run.Raw('&&')
                         ] + args)
 
+def get_constraints_url(cconf):
+    version = cconf.get('force-branch', 'master')
+    if '/' in version:
+        # split stable/<version> to <version>
+        version = str(version).split('/')[1]
+    url = f"https://releases.openstack.org/constraints/upper/{version}"
+    return url
+
 @contextlib.contextmanager
 def setup_venv(ctx, config):
     """
@@ -95,13 +103,14 @@ def setup_venv(ctx, config):
     """
     assert isinstance(config, dict)
     log.info('Setting up virtualenv for barbican...')
-    for (client, _) in config.items():
+    for (client, cconf) in config.items():
         run_in_barbican_dir(ctx, client,
                             ['python3', '-m', 'venv', '.barbicanenv'])
         run_in_barbican_venv(ctx, client,
                              ['pip', 'install', '--upgrade', 'pip'])
+        url = get_constraints_url(cconf)
         run_in_barbican_venv(ctx, client,
-                             ['pip', 'install', 'pytz',
+                             ['pip', 'install', f'-c{url}', 'pytz',
                               '-e', get_barbican_dir(ctx)])
     yield
 
@@ -136,9 +145,8 @@ def set_authtoken_params(ctx, cclient, cconfig):
                         ['sed', '-i',
                          '/[[]filter:authtoken]/{p;s##'+'auth_uri = {}'.format(url)+'#;}',
                          'etc/barbican/barbican-api-paste.ini'])
-    admin_host, admin_port = ctx.keystone.admin_endpoints[keystone_role]
-    admin_url = 'http://{host}:{port}/v3'.format(host=admin_host,
-                                                 port=admin_port)
+    admin_url = 'http://{host}:{port}/v3'.format(host=public_host,
+                                                 port=public_port)
     run_in_barbican_dir(ctx, cclient,
                         ['sed', '-i',
                          '/[[]filter:authtoken]/{p;s##'+'auth_url = {}'.format(admin_url)+'#;}',
@@ -157,12 +165,6 @@ def fix_barbican_api(ctx, cclient):
                          '/prop_dir =/ s#etc/barbican#{}/etc/barbican#'.format(get_barbican_dir(ctx)),
                          'bin/barbican-api'])
 
-def copy_policy_json(ctx, cclient):
-    run_in_barbican_dir(ctx, cclient,
-                        ['cp',
-                         get_barbican_dir(ctx)+'/etc/barbican/policy.json',
-                         get_barbican_dir(ctx)])
-
 def create_barbican_conf(ctx, cclient):
     barbican_host, barbican_port = ctx.barbican.endpoints[cclient]
     barbican_url = 'http://{host}:{port}'.format(host=barbican_host,
@@ -173,6 +175,14 @@ def create_barbican_conf(ctx, cclient):
                         ['bash', '-c',
                          'echo -n -e "[DEFAULT]\nhost_href=' + barbican_url + '\n" ' + \
                          '>barbican.conf'])
+
+    log.info("run barbican db upgrade")
+    config_path = get_barbican_dir(ctx) + '/barbican.conf'
+    run_in_barbican_venv(ctx, cclient, ['barbican-manage', '--config-file', config_path,
+                                        'db', 'upgrade'])
+    log.info("run barbican db sync_secret_stores")
+    run_in_barbican_venv(ctx, cclient, ['barbican-manage', '--config-file', config_path,
+                                        'db', 'sync_secret_stores'])
 
 @contextlib.contextmanager
 def configure_barbican(ctx, config):
@@ -189,7 +199,6 @@ def configure_barbican(ctx, config):
     set_authtoken_params(ctx, cclient, cconfig)
     fix_barbican_api(ctx, cclient)
     fix_barbican_api_paste(ctx, cclient)
-    copy_policy_json(ctx, cclient)
     create_barbican_conf(ctx, cclient)
     try:
         yield

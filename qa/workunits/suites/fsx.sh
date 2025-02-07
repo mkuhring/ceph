@@ -2,12 +2,13 @@
 
 set -e
 
-git clone git://git.ceph.com/xfstests.git
-cd xfstests
-git checkout 12973fc04fd10d4af086901e10ffa8e48866b735
+git clone https://git.ceph.com/xfstests-dev.git
+cd xfstests-dev
+# This sha1 is the latest master head and works well for our tests.
+git checkout 0e5c12dfd008efc2848c98108c9237487e91ef35
 make -j4
 cd ..
-cp xfstests/ltp/fsx .
+cp xfstests-dev/ltp/fsx .
 
 OPTIONS="-z"  # don't use zero range calls; not supported by cephfs
 

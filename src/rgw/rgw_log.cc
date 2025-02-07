@@ -94,7 +94,7 @@ string render_log_object_name(const string& format,
 /* usage logger */
 class UsageLogger : public DoutPrefixProvider {
   CephContext *cct;
-  rgw::sal::Store* store;
+  rgw::sal::Driver* driver;
   map<rgw_user_bucket, RGWUsageBatch> usage_map;
   ceph::mutex lock = ceph::make_mutex("UsageLogger");
   int32_t num_entries;
@@ -117,7 +117,7 @@ class UsageLogger : public DoutPrefixProvider {
   }
 public:
 
-  UsageLogger(CephContext *_cct, rgw::sal::Store* _store) : cct(_cct), store(_store), num_entries(0), timer(cct, timer_lock) {
+  UsageLogger(CephContext *_cct, rgw::sal::Driver* _driver) : cct(_cct), driver(_driver), num_entries(0), timer(cct, timer_lock) {
     timer.init();
     std::lock_guard l{timer_lock};
     set_timer();
@@ -171,7 +171,7 @@ public:
     num_entries = 0;
     lock.unlock();
 
-    store->log_usage(this, old_map);
+    driver->log_usage(this, old_map, null_yield);
   }
 
   CephContext *get_cct() const override { return cct; }
@@ -181,9 +181,9 @@ public:
 
 static UsageLogger *usage_logger = NULL;
 
-void rgw_log_usage_init(CephContext *cct, rgw::sal::Store* store)
+void rgw_log_usage_init(CephContext *cct, rgw::sal::Driver* driver)
 {
-  usage_logger = new UsageLogger(cct, store);
+  usage_logger = new UsageLogger(cct, driver);
 }
 
 void rgw_log_usage_finalize()
@@ -200,21 +200,23 @@ static void log_usage(req_state *s, const string& op_name)
   if (!usage_logger)
     return;
 
-  rgw_user user;
-  rgw_user payer;
-  string bucket_name;
-
-  bucket_name = s->bucket_name;
+  std::string user = to_string(s->owner.id);
+  std::string payer;
+  string bucket_name = s->bucket_name;
 
   if (!bucket_name.empty()) {
-  bucket_name = s->bucket_name;
-    user = s->bucket_owner.get_id();
+    user = to_string(s->bucket_owner.id);
+
+    // As per https://docs.aws.amazon.com/AmazonS3/latest/userguide/RequesterPaysBuckets.html#ChargeDetails
+    // If the bucket has requester pays enabled,
+    // and the requerster includes x-amz-request-payer in the header (this is checked by verify_requester_payer_permission and results in 403 if not present),
+    // and the status code isn't 403,
+    // then the requester is the payer.
     if (!rgw::sal::Bucket::empty(s->bucket.get()) &&
-	s->bucket->get_info().requester_pays) {
-      payer = s->user->get_id();
+        s->bucket->get_info().requester_pays &&
+        s->err.http_ret != 403) {
+      payer = s->user->get_id().to_str();
     }
-  } else {
-      user = s->user->get_id();
   }
 
   bool error = s->err.is_err();
@@ -222,9 +224,7 @@ static void log_usage(req_state *s, const string& op_name)
     bucket_name = "-"; /* bucket not found, use the invalid '-' as bucket name */
   }
 
-  string u = user.to_str();
-  string p = payer.to_str();
-  rgw_usage_log_entry entry(u, p, bucket_name);
+  rgw_usage_log_entry entry(user, payer, bucket_name);
 
   uint64_t bytes_sent = ACCOUNTING_IO(s)->get_bytes_sent();
   uint64_t bytes_received = ACCOUNTING_IO(s)->get_bytes_received();
@@ -238,9 +238,12 @@ static void log_usage(req_state *s, const string& op_name)
   ldpp_dout(s, 30) << "log_usage: bucket_name=" << bucket_name
 	<< " tenant=" << s->bucket_tenant
 	<< ", bytes_sent=" << bytes_sent << ", bytes_received="
-	<< bytes_received << ", success=" << data.successful_ops << dendl;
+	<< bytes_received << ", success=" << data.successful_ops
+	<< ", bytes_processed=" << s->s3select_usage.bytes_processed
+	<< ", bytes_returned=" << s->s3select_usage.bytes_returned << dendl;
 
-  entry.add(op_name, data);
+  entry.add_usage(op_name, data);
+  entry.s3select_usage = s->s3select_usage;
 
   utime_t ts = ceph_clock_now();
 
@@ -251,13 +254,14 @@ void rgw_format_ops_log_entry(struct rgw_log_entry& entry, Formatter *formatter)
 {
   formatter->open_object_section("log_entry");
   formatter->dump_string("bucket", entry.bucket);
+  formatter->dump_string("object", entry.obj.name);
   {
     auto t = utime_t{entry.time};
     t.gmtime(formatter->dump_stream("time"));      // UTC
     t.localtime(formatter->dump_stream("time_local"));
   }
   formatter->dump_string("remote_addr", entry.remote_addr);
-  string obj_owner = entry.object_owner.to_str();
+  string obj_owner = to_string(entry.object_owner);
   if (obj_owner.length())
     formatter->dump_string("object_owner", obj_owner);
   formatter->dump_string("user", entry.user);
@@ -301,6 +305,9 @@ void rgw_format_ops_log_entry(struct rgw_log_entry& entry, Formatter *formatter)
     case TYPE_ROLE:
       formatter->dump_string("authentication_type","STS");
       break;
+    case TYPE_ROOT:
+      formatter->dump_string("authentication_type", "Local Account Root");
+      break;
     default:
       break;
   }
@@ -323,6 +330,29 @@ void rgw_format_ops_log_entry(struct rgw_log_entry& entry, Formatter *formatter)
     formatter->dump_string("subuser", entry.subuser);
   }
   formatter->dump_bool("temp_url", entry.temp_url);
+
+  if (entry.op == "multi_object_delete") {
+    formatter->open_object_section("op_data");
+    formatter->dump_int("num_ok", entry.delete_multi_obj_meta.num_ok);
+    formatter->dump_int("num_err", entry.delete_multi_obj_meta.num_err);
+    formatter->open_array_section("objects");
+    for (const auto& iter: entry.delete_multi_obj_meta.objects) {
+      formatter->open_object_section("");
+      formatter->dump_string("key", iter.key);
+      formatter->dump_string("version_id", iter.version_id);
+      formatter->dump_int("http_status", iter.http_status);
+      formatter->dump_bool("error", iter.error);
+      if (iter.error) {
+        formatter->dump_string("error_message", iter.error_message);
+      } else {
+        formatter->dump_bool("delete_marker", iter.delete_marker);
+        formatter->dump_string("marker_version_id", iter.marker_version_id);
+      }
+      formatter->close_section();
+    }
+    formatter->close_section();
+    formatter->close_section();
+  }
   formatter->close_section();
 }
 
@@ -492,7 +522,7 @@ int OpsLogSocket::log_json(req_state* s, bufferlist& bl)
   return 0;
 }
 
-OpsLogRados::OpsLogRados(rgw::sal::Store* const& store): store(store)
+OpsLogRados::OpsLogRados(rgw::sal::Driver* const& driver): driver(driver)
 {
 }
 
@@ -512,17 +542,18 @@ int OpsLogRados::log(req_state* s, struct rgw_log_entry& entry)
     localtime_r(&t, &bdt);
   string oid = render_log_object_name(s->cct->_conf->rgw_log_object_name, &bdt,
                                       entry.bucket_id, entry.bucket);
-  if (store->log_op(s, oid, bl) < 0) {
+  if (driver->log_op(s, oid, bl) < 0) {
     ldpp_dout(s, 0) << "ERROR: failed to log RADOS RGW ops log entry for txn: " << s->trans_id << dendl;
     return -1;
   }
   return 0;
 }
 
-int rgw_log_op(RGWREST* const rest, req_state *s, const string& op_name, OpsLogSink *olog)
+int rgw_log_op(RGWREST* const rest, req_state *s, const RGWOp* op, OpsLogSink *olog)
 {
   struct rgw_log_entry entry;
   string bucket_id;
+  string op_name = (op ? op->name() : "unknown");
 
   if (s->enable_usage_log)
     log_usage(s, op_name);
@@ -581,13 +612,9 @@ int rgw_log_op(RGWREST* const rest, req_state *s, const string& op_name, OpsLogS
     uri.append(s->info.env->get("REQUEST_URI"));
   }
 
-  if (s->info.env->exists("QUERY_STRING")) {
-    const char* qs = s->info.env->get("QUERY_STRING");
-    if(qs && (*qs != '\0')) {
-      uri.append("?");
-      uri.append(qs);
-    }
-  }
+  /* Formerly, we appended QUERY_STRING to uri, but in RGW, QUERY_STRING is a
+   * substring of REQUEST_URI--appending qs to uri here duplicates qs to the
+   * ops log */
 
   if (s->info.env->exists("HTTP_VERSION")) {
     uri.append(" ");
@@ -598,6 +625,9 @@ int rgw_log_op(RGWREST* const rest, req_state *s, const string& op_name, OpsLogS
   entry.uri = std::move(uri);
 
   entry.op = op_name;
+  if (op) {
+    op->write_ops_log_entry(entry);
+  }
 
   if (s->auth.identity) {
     entry.identity_type = s->auth.identity->get_identity_type();
@@ -623,9 +653,8 @@ int rgw_log_op(RGWREST* const rest, req_state *s, const string& op_name, OpsLogS
   }
 
   entry.user = s->user->get_id().to_str();
-  if (s->object_acl)
-    entry.object_owner = s->object_acl->get_owner().get_id();
-  entry.bucket_owner = s->bucket_owner.get_id();
+  entry.object_owner = s->object_acl.get_owner().id;
+  entry.bucket_owner = s->bucket_owner.id;
 
   uint64_t bytes_sent = ACCOUNTING_IO(s)->get_bytes_sent();
   uint64_t bytes_received = ACCOUNTING_IO(s)->get_bytes_received();
@@ -653,8 +682,8 @@ int rgw_log_op(RGWREST* const rest, req_state *s, const string& op_name, OpsLogS
 void rgw_log_entry::generate_test_instances(list<rgw_log_entry*>& o)
 {
   rgw_log_entry *e = new rgw_log_entry;
-  e->object_owner = "object_owner";
-  e->bucket_owner = "bucket_owner";
+  e->object_owner = parse_owner("object_owner");
+  e->bucket_owner = parse_owner("bucket_owner");
   e->bucket = "bucket";
   e->remote_addr = "1.2.3.4";
   e->user = "user";
@@ -670,14 +699,16 @@ void rgw_log_entry::generate_test_instances(list<rgw_log_entry*>& o)
   e->bucket_id = "10";
   e->trans_id = "trans_id";
   e->identity_type = TYPE_RGW;
+  e->account_id = "account_id";
+  e->role_id = "role_id";
   o.push_back(e);
   o.push_back(new rgw_log_entry);
 }
 
 void rgw_log_entry::dump(Formatter *f) const
 {
-  f->dump_string("object_owner", object_owner.to_str());
-  f->dump_string("bucket_owner", bucket_owner.to_str());
+  f->dump_string("object_owner", to_string(object_owner));
+  f->dump_string("bucket_owner", to_string(bucket_owner));
   f->dump_string("bucket", bucket);
   f->dump_stream("time") << time;
   f->dump_string("remote_addr", remote_addr);
@@ -696,4 +727,10 @@ void rgw_log_entry::dump(Formatter *f) const
   f->dump_string("bucket_id", bucket_id);
   f->dump_string("trans_id", trans_id);
   f->dump_unsigned("identity_type", identity_type);
+  if (!account_id.empty()) {
+    f->dump_string("account_id", account_id);
+  }
+  if (!role_id.empty()) {
+    f->dump_string("role_id", role_id);
+  }
 }

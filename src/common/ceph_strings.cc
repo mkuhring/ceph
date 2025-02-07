@@ -110,6 +110,10 @@ const char *ceph_release_name(int r)
 		return "pacific";
 	case CEPH_RELEASE_QUINCY:
 		return "quincy";
+	case CEPH_RELEASE_REEF:
+		return "reef";
+	case CEPH_RELEASE_SQUID:
+		return "squid";
 	default:
 		if (r < 0)
 			return "unspecified";
@@ -149,7 +153,15 @@ uint64_t ceph_release_features(int r)
 		return req;
 
 	req |= CEPH_FEATUREMASK_CRUSH_CHOOSE_ARGS; // and overlaps
-	if (r <= CEPH_RELEASE_LUMINOUS)
+	if (r <= CEPH_RELEASE_QUINCY)
+		return req;
+
+	req |= CEPH_FEATUREMASK_SERVER_REEF; // upmap-primary
+	if (r <= CEPH_RELEASE_REEF)
+		return req;
+
+	req |= CEPH_FEATUREMASK_CRUSH_MSR;
+	if (r <= CEPH_RELEASE_SQUID)
 		return req;
 
 	return req;
@@ -277,6 +289,7 @@ const char *ceph_mds_op_name(int op)
 	case CEPH_MDS_OP_LOOKUPINO:  return "lookupino";
 	case CEPH_MDS_OP_LOOKUPNAME:  return "lookupname";
 	case CEPH_MDS_OP_GETATTR:  return "getattr";
+	case CEPH_MDS_OP_DUMMY:  return "dummy";
 	case CEPH_MDS_OP_SETXATTR: return "setxattr";
 	case CEPH_MDS_OP_SETATTR: return "setattr";
 	case CEPH_MDS_OP_RMXATTR: return "rmxattr";
@@ -297,6 +310,7 @@ const char *ceph_mds_op_name(int op)
 	case CEPH_MDS_OP_MKSNAP: return "mksnap";
 	case CEPH_MDS_OP_RMSNAP: return "rmsnap";
 	case CEPH_MDS_OP_RENAMESNAP: return "renamesnap";
+	case CEPH_MDS_OP_READDIR_SNAPDIFF: return "readdir_snapdiff";
 	case CEPH_MDS_OP_SETFILELOCK: return "setfilelock";
 	case CEPH_MDS_OP_GETFILELOCK: return "getfilelock";
 	case CEPH_MDS_OP_FRAGMENTDIR: return "fragmentdir";
@@ -305,6 +319,8 @@ const char *ceph_mds_op_name(int op)
 	case CEPH_MDS_OP_ENQUEUE_SCRUB: return "enqueue_scrub";
 	case CEPH_MDS_OP_REPAIR_FRAGSTATS: return "repair_fragstats";
 	case CEPH_MDS_OP_REPAIR_INODESTATS: return "repair_inodestats";
+	case CEPH_MDS_OP_QUIESCE_PATH: return "quiesce_path";
+	case CEPH_MDS_OP_QUIESCE_INODE: return "quiesce_inode";
 	}
 	return "???";
 }

@@ -74,6 +74,9 @@ if (WITH_RADOSGW)
   set(cls_otp_srcs otp/cls_otp.cc)
   add_library(cls_otp SHARED ${cls_otp_srcs})
   target_link_libraries(cls_otp OATH::OATH)
+  target_include_directories(cls_otp
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados"
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw")
   set_target_properties(cls_otp PROPERTIES
     VERSION "1.0.0"
     SOVERSION "1"
@@ -197,7 +200,10 @@ if (WITH_RADOSGW)
     rgw/cls_rgw_types.cc
     ${CMAKE_SOURCE_DIR}/src/common/ceph_json.cc)
   add_library(cls_rgw SHARED ${cls_rgw_srcs})
-  target_link_libraries(cls_rgw json_spirit)
+  target_link_libraries(cls_rgw ${FMT_LIB} json_spirit)
+  target_include_directories(cls_rgw
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados"
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw")
   set_target_properties(cls_rgw PROPERTIES
     VERSION "1.0.0"
     SOVERSION "1"
@@ -210,6 +216,9 @@ if (WITH_RADOSGW)
     rgw/cls_rgw_types.cc
     rgw/cls_rgw_ops.cc)
   add_library(cls_rgw_client STATIC ${cls_rgw_client_srcs})
+  target_include_directories(cls_rgw_client
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados"
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw")
 
 endif (WITH_RADOSGW)
 
@@ -299,6 +308,9 @@ if (WITH_RADOSGW)
     queue/cls_queue_src.cc
     ${CMAKE_SOURCE_DIR}/src/common/ceph_json.cc)
   add_library(cls_rgw_gc SHARED ${cls_rgw_gc_srcs})
+  target_include_directories(cls_rgw_gc
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados"
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw")
   set_target_properties(cls_rgw_gc PROPERTIES
     VERSION "1.0.0"
     SOVERSION "1"
@@ -307,8 +319,12 @@ if (WITH_RADOSGW)
   install(TARGETS cls_rgw_gc DESTINATION ${cls_dir})
 
   set(cls_rgw_gc_client_srcs
-    rgw_gc/cls_rgw_gc_client.cc)
+    rgw_gc/cls_rgw_gc_client.cc
+    rgw/cls_rgw_types.cc)
   add_library(cls_rgw_gc_client STATIC ${cls_rgw_gc_client_srcs})
+  target_include_directories(cls_rgw_gc_client
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados"
+	  PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw")
 endif (WITH_RADOSGW)
 
 
@@ -339,14 +355,7 @@ set_target_properties(cls_fifo PROPERTIES
   SOVERSION "1"
   INSTALL_RPATH ""
   CXX_VISIBILITY_PRESET hidden)
+target_link_libraries(cls_fifo ${FMT_LIB})
 install(TARGETS cls_fifo DESTINATION ${cls_dir})
 
-# cls_test_remote_reads
-set(cls_test_remote_reads_srcs test_remote_reads/cls_test_remote_reads.cc)
-add_library(cls_test_remote_reads SHARED ${cls_test_remote_reads_srcs})
-set_target_properties(cls_test_remote_reads PROPERTIES
-  VERSION "1.0.0"
-  SOVERSION "1"
-  INSTALL_RPATH ""
-  CXX_VISIBILITY_PRESET hidden)
-install(TARGETS cls_test_remote_reads DESTINATION ${cls_dir})
+

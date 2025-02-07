@@ -10,14 +10,13 @@ a state-of-the-art, multi-use, highly available, and performant file store for
 a variety of applications, including traditional use-cases like shared home
 directories, HPC scratch space, and distributed workflow shared storage.
 
-CephFS achieves these goals through the use of some novel architectural
-choices.  Notably, file metadata is stored in a separate RADOS pool from file
-data and served via a resizable cluster of *Metadata Servers*, or **MDS**,
-which may scale to support higher throughput metadata workloads.  Clients of
-the file system have direct access to RADOS for reading and writing file data
-blocks. For this reason, workloads may linearly scale with the size of the
-underlying RADOS object store; that is, there is no gateway or broker mediating
-data I/O for clients.
+CephFS achieves these goals through novel architectural choices. Notably, file
+metadata is stored in a RADOS pool separate from file data and is served via a
+resizable cluster of *Metadata Servers*, or **MDS**\es, which scale to support
+higher-throughput workloads. Clients of the file system have direct access to
+RADOS for reading and writing file data blocks. This makes it possible for
+workloads to scale linearly with the size of the underlying RADOS object store.
+There is no gateway or broker that mediates data I/O for clients.
 
 Access to data is coordinated through the cluster of MDS which serve as
 authorities for the state of the distributed metadata cache cooperatively
@@ -38,16 +37,17 @@ Block Devices) and RGW (Ceph Object Storage Gateway).
 Getting Started with CephFS
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-For most deployments of Ceph, setting up a CephFS file system is as simple as:
+For most deployments of Ceph, setting up your first CephFS file system is as simple as:
 
-.. code:: bash
+.. prompt:: bash
 
-    ceph fs volume create <fs name>
+    # Create a CephFS volume named (for example) "cephfs":
+    ceph fs volume create cephfs
 
 The Ceph `Orchestrator`_  will automatically create and configure MDS for
 your file system if the back-end deployment technology supports it (see
 `Orchestrator deployment table`_). Otherwise, please `deploy MDS manually
-as needed`_.
+as needed`_. You can also `create other CephFS volumes`_.
 
 Finally, to mount CephFS on your client nodes, see `Mount CephFS:
 Prerequisites`_ page. Additionally, a command-line shell utility is available
@@ -55,6 +55,7 @@ for interactive access or scripting via the `cephfs-shell`_.
 
 .. _Orchestrator: ../mgr/orchestrator
 .. _deploy MDS manually as needed: add-remove-mds
+.. _create other CephFS volumes: fs-volumes
 .. _Orchestrator deployment table: ../mgr/orchestrator/#current-implementation-status
 .. _Mount CephFS\: Prerequisites: mount-prerequisites
 .. _cephfs-shell: ../man/8/cephfs-shell
@@ -92,6 +93,7 @@ Administration
     CephFS Top Utility <cephfs-top>
     Scheduled Snapshots <snap-schedule>
     CephFS Snapshot Mirroring <cephfs-mirroring>
+    Purge Queue <purge-queue>
 
 .. raw:: html
 
@@ -146,6 +148,7 @@ CephFS Concepts
     LazyIO <lazyio>
     Directory fragmentation <dirfrags>
     Multiple active MDS daemons <multimds>
+    Snapshots <snapshots>
 
 
 .. raw:: html
@@ -191,6 +194,7 @@ Developer Guides
     Client's Capabilities <capabilities>
     Java and Python bindings <api/index>
     Mantle <mantle>
+    Metrics <metrics>
 
 
 .. raw:: html

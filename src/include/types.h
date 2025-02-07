@@ -28,12 +28,6 @@
 #include "ceph_frag.h"
 #include "rbd_types.h"
 
-#ifdef __cplusplus
-#ifndef _BACKWARD_BACKWARD_WARNING_H
-#define _BACKWARD_BACKWARD_WARNING_H   // make gcc 4.3 shut up about hash_*
-#endif
-#endif
-
 extern "C" {
 #include <stdint.h>
 #include <sys/types.h>
@@ -103,6 +97,8 @@ template<class A, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::list<A,Alloc>& ilist);
 template<class A, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::set<A, Comp, Alloc>& iset);
+template<class A, class Comp, class Alloc>
+inline std::ostream& operator<<(std::ostream& out, const std::unordered_set<A, Comp, Alloc>& iset);
 template<class A, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::multiset<A,Comp,Alloc>& iset);
 template<class A, class B, class Comp, class Alloc>
@@ -200,6 +196,17 @@ inline std::ostream& operator<<(std::ostream& out, const std::list<A,Alloc>& ili
 
 template<class A, class Comp, class Alloc>
 inline std::ostream& operator<<(std::ostream& out, const std::set<A, Comp, Alloc>& iset) {
+  for (auto it = iset.begin();
+       it != iset.end();
+       ++it) {
+    if (it != iset.begin()) out << ",";
+    out << *it;
+  }
+  return out;
+}
+
+template<class A, class Comp, class Alloc>
+inline std::ostream& operator<<(std::ostream& out, const std::unordered_set<A, Comp, Alloc>& iset) {
   for (auto it = iset.begin();
        it != iset.end();
        ++it) {
@@ -320,7 +327,6 @@ WRITE_RAW_ENCODER(ceph_file_layout)
 WRITE_RAW_ENCODER(ceph_dir_layout)
 WRITE_RAW_ENCODER(ceph_mds_session_head)
 WRITE_RAW_ENCODER(ceph_mds_request_head_legacy)
-WRITE_RAW_ENCODER(ceph_mds_request_head)
 WRITE_RAW_ENCODER(ceph_mds_request_release)
 WRITE_RAW_ENCODER(ceph_filelock)
 WRITE_RAW_ENCODER(ceph_mds_caps_head)
@@ -371,6 +377,14 @@ struct client_t {
   void decode(ceph::buffer::list::const_iterator& bl) {
     using ceph::decode;
     decode(v, bl);
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_int("id", v);
+  }
+  static void generate_test_instances(std::list<client_t*>& ls) {
+    ls.push_back(new client_t);
+    ls.push_back(new client_t(1));
+    ls.push_back(new client_t(123));
   }
 };
 WRITE_CLASS_ENCODER(client_t)
@@ -462,6 +476,10 @@ struct byte_u_t {
   explicit byte_u_t(uint64_t _v) : v(_v) {};
 };
 
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<byte_u_t> : fmt::ostream_formatter {};
+#endif
+
 inline std::ostream& operator<<(std::ostream& out, const byte_u_t& b)
 {
   uint64_t n = b.v;
@@ -504,9 +522,9 @@ struct shard_id_t {
   int8_t id;
 
   shard_id_t() : id(0) {}
-  explicit shard_id_t(int8_t _id) : id(_id) {}
+  constexpr explicit shard_id_t(int8_t _id) : id(_id) {}
 
-  operator int8_t() const { return id; }
+  constexpr operator int8_t() const { return id; }
 
   const static shard_id_t NO_SHARD;
 
@@ -518,7 +536,13 @@ struct shard_id_t {
     using ceph::decode;
     decode(id, bl);
   }
-
+  void dump(ceph::Formatter *f) const {
+    f->dump_int("id", id);
+  }
+  static void generate_test_instances(std::list<shard_id_t*>& ls) {
+    ls.push_back(new shard_id_t(1));
+    ls.push_back(new shard_id_t(2));
+  }
   bool operator==(const shard_id_t&) const = default;
   auto operator<=>(const shard_id_t&) const = default;
 };
@@ -562,6 +586,13 @@ struct errorcode32_t {
     decode(code, bl);
     code = ceph_to_hostos_errno(code);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_int("code", code);
+  }
+  static void generate_test_instances(std::list<errorcode32_t*>& ls) {
+    ls.push_back(new errorcode32_t(1));
+    ls.push_back(new errorcode32_t(2));
+  }
 };
 WRITE_CLASS_ENCODER(errorcode32_t)
 
@@ -603,6 +634,16 @@ struct sha_digest_t {
     decode(tmparr, bl);
     memcpy(v, tmparr.data(), SIZE);
   }
+  void dump(ceph::Formatter *f) const {
+    f->dump_string("sha1", to_str());
+  }
+  static void generate_test_instances(std::list<sha_digest_t*>& ls) {
+    ls.push_back(new sha_digest_t);
+    ls.push_back(new sha_digest_t);
+    ls.back()->v[0] = 1;
+    ls.push_back(new sha_digest_t);
+    ls.back()->v[0] = 2;
+  }
 };
 
 template<uint8_t S>
@@ -610,6 +651,10 @@ inline std::ostream &operator<<(std::ostream &out, const sha_digest_t<S> &b) {
   std::string str = b.to_str();
   return out << str;
 }
+
+#if FMT_VERSION >= 90000
+template <uint8_t S> struct fmt::formatter<sha_digest_t<S>> : fmt::ostream_formatter {};
+#endif
 
 using sha1_digest_t = sha_digest_t<20>;
 WRITE_CLASS_ENCODER(sha1_digest_t)

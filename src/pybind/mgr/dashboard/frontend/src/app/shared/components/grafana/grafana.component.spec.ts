@@ -21,7 +21,7 @@ describe('GrafanaComponent', () => {
   const expected_url =
     'http:localhost:3000/d/foo/somePath&refresh=2s&var-datasource=Dashboard1&kiosk&from=now-1h&to=now';
   const expected_logs_url =
-    'http:localhost:3000/explore?orgId=1&left=["now-1h","now","Loki",{"refId":"A"}]&kiosk';
+    'http:localhost:3000/explore?orgId=1&left={"datasource": "Loki", "queries": [{"refId": "A"}], "range": {"from": "now-1h", "to": "now"}}&kiosk';
 
   configureTestBed({
     declarations: [GrafanaComponent, AlertPanelComponent, LoadingPanelComponent, DocComponent],
@@ -35,6 +35,7 @@ describe('GrafanaComponent', () => {
     component.grafanaPath = 'somePath';
     component.type = 'metrics';
     component.uid = 'foo';
+    component.title = 'panel title';
   });
 
   it('should create', () => {

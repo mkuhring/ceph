@@ -23,22 +23,42 @@
  * stuff to live.
  */
 
+#include <iosfwd>
 #include <string>
 #include <vector>
 
 #include "common/entity_name.h"
+#include "include/encoding.h"
+#include "msg/msg_types.h" // for struct entity_addr_t
+
+class entity_addrvec_t;
 
 /////////////////////// Types ///////////////////////
 class CephInitParameters
 {
 public:
   explicit CephInitParameters(uint32_t module_type_);
-  std::list<std::string> get_conf_files() const;
 
   uint32_t module_type;
   EntityName name;
   bool no_config_file = false;
+
+  void encode(ceph::buffer::list& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(module_type, bl);
+    encode(name, bl);
+    encode(no_config_file, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(ceph::buffer::list::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(module_type, bl);
+    decode(name, bl);
+    decode(no_config_file, bl);
+    DECODE_FINISH(bl);
+  }
 };
+WRITE_CLASS_ENCODER(CephInitParameters)
 
 /////////////////////// Functions ///////////////////////
 extern void string_to_vec(std::vector<std::string>& args, std::string argstr);

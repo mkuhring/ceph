@@ -24,6 +24,7 @@
 #include "include/int_types.h"
 #include "include/types.h"
 #include "include/fs_types.h"
+#include "include/unordered_map.h"
 
 // We're only converting errors defined in errno.h, not standard Windows
 // system error codes that are usually retrievied using GetLastErrorCode().
@@ -638,7 +639,7 @@ static const ceph::unordered_map<int,NTSTATUS> cephfs_errno_to_ntstatus = {
   {CEPHFS_EOLDSNAPC,       STATUS_DATA_ERROR}
 };
 
-__u32 cephfs_errno_to_ntsatus(int cephfs_errno)
+__u32 cephfs_errno_to_ntstatus_map(int cephfs_errno)
 {
   cephfs_errno = abs(cephfs_errno);
 

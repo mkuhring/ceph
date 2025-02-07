@@ -1,9 +1,11 @@
 import json
+import re
 import logging
-from typing import TYPE_CHECKING, Iterator, Optional, Dict, Any
+from typing import TYPE_CHECKING, Iterator, Optional, Dict, Any, List
 
-from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, HostPlacementSpec
+from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, HostPlacementSpec, RGWSpec
 from cephadm.schedule import HostAssignment
+from cephadm.utils import SpecialHostLabels
 import rados
 
 from mgr_module import NFS_POOL_NAME
@@ -12,7 +14,7 @@ from orchestrator import OrchestratorError, DaemonDescription
 if TYPE_CHECKING:
     from .module import CephadmOrchestrator
 
-LAST_MIGRATION = 5
+LAST_MIGRATION = 7
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +33,13 @@ class Migrations:
         # We have the cache, the inventory, the config store, the upgrade (imagine changing the
         # upgrade code, while an old upgrade is still in progress), naming of daemons,
         # fs-layout of the daemons, etc.
-        if self.mgr.migration_current is None:
-            self.set(LAST_MIGRATION)
+        self.set_sane_migration_current()
 
         v = mgr.get_store('nfs_migration_queue')
         self.nfs_migration_queue = json.loads(v) if v else []
+
+        r = mgr.get_store('rgw_migration_queue')
+        self.rgw_migration_queue = json.loads(r) if r else []
 
         # for some migrations, we don't need to do anything except for
         # incrementing migration_current.
@@ -46,8 +50,29 @@ class Migrations:
         self.mgr.set_module_option('migration_current', val)
         self.mgr.migration_current = val
 
+    def set_sane_migration_current(self) -> None:
+        # migration current should always be an integer
+        # between 0 and LAST_MIGRATION (inclusive) in order to
+        # actually carry out migration. If we find
+        # it is None or too high of a value here we should
+        # set it to some sane value
+        mc: Optional[int] = self.mgr.migration_current
+        if mc is None:
+            logger.info('Found migration_current of "None". Setting to last migration.')
+            self.set(LAST_MIGRATION)
+            return
+
+        if mc > LAST_MIGRATION:
+            logger.error(f'Found migration_current of {mc} when max should be {LAST_MIGRATION}. Setting back to 0.')
+            # something has gone wrong and caused migration_current
+            # to be higher than it should be able to be. Best option
+            # we have here is to just set it back to 0
+            self.set(0)
+
     def is_migration_ongoing(self) -> bool:
-        return self.mgr.migration_current != LAST_MIGRATION
+        self.set_sane_migration_current()
+        mc: Optional[int] = self.mgr.migration_current
+        return mc is None or mc < LAST_MIGRATION
 
     def verify_no_migration(self) -> None:
         if self.is_migration_ongoing():
@@ -75,6 +100,14 @@ class Migrations:
         if self.mgr.migration_current == 4:
             if self.migrate_4_5():
                 self.set(5)
+
+        if self.mgr.migration_current == 5:
+            if self.migrate_5_6():
+                self.set(6)
+
+        if self.mgr.migration_current == 6:
+            if self.migrate_6_7():
+                self.set(7)
 
     def migrate_0_1(self) -> bool:
         """
@@ -280,7 +313,7 @@ class Migrations:
         if 'client.admin' not in self.mgr.keys.keys:
             self.mgr._client_keyring_set(
                 entity='client.admin',
-                placement='label:_admin',
+                placement=f'label:{SpecialHostLabels.ADMIN}',
             )
         return True
 
@@ -315,6 +348,112 @@ class Migrations:
 
             self.mgr.log.info('Done migrating registry login info')
         return True
+
+    def migrate_rgw_spec(self, spec: Dict[Any, Any]) -> Optional[RGWSpec]:
+        """ Migrate an old rgw spec to the new format."""
+        new_spec = spec.copy()
+        field_content: List[str] = re.split(' +', new_spec['spec']['rgw_frontend_type'])
+        valid_spec = False
+        if 'beast' in field_content:
+            new_spec['spec']['rgw_frontend_type'] = 'beast'
+            field_content.remove('beast')
+            valid_spec = True
+        elif 'civetweb' in field_content:
+            new_spec['spec']['rgw_frontend_type'] = 'civetweb'
+            field_content.remove('civetweb')
+            valid_spec = True
+        else:
+            # Error: Should not happen as that would be an invalid RGW spec. In that case
+            # we keep the spec as it, mark it as unmanaged to avoid the daemons being deleted
+            # and raise a health warning so the user can fix the issue manually later.
+            self.mgr.log.error("Cannot migrate RGW spec, bad rgw_frontend_type value: {spec['spec']['rgw_frontend_type']}.")
+
+        if valid_spec:
+            new_spec['spec']['rgw_frontend_extra_args'] = []
+            new_spec['spec']['rgw_frontend_extra_args'].extend(field_content)
+
+        return RGWSpec.from_json(new_spec)
+
+    def rgw_spec_needs_migration(self, spec: Dict[Any, Any]) -> bool:
+        if 'spec' not in spec:
+            # if users allowed cephadm to set up most of the
+            # attributes, it's possible there is no "spec" section
+            # inside the spec. In that case, no migration is needed
+            return False
+        return 'rgw_frontend_type' in spec['spec'] \
+            and spec['spec']['rgw_frontend_type'] is not None \
+            and spec['spec']['rgw_frontend_type'].strip() not in ['beast', 'civetweb']
+
+    def migrate_5_6(self) -> bool:
+        """
+        Migration 5 -> 6
+
+        Old RGW spec used to allow 'bad' values on the rgw_frontend_type field. For example
+        the following value used to be valid:
+
+          rgw_frontend_type: "beast endpoint=10.16.96.54:8043 tcp_nodelay=1"
+
+        As of 17.2.6 release, these kind of entries are not valid anymore and a more strict check
+        has been added to validate this field.
+
+        This migration logic detects this 'bad' values and tries to transform them to the new
+        valid format where rgw_frontend_type field can only be either 'beast' or 'civetweb'.
+        Any extra arguments detected on rgw_frontend_type field will be parsed and passed in the
+        new spec field rgw_frontend_extra_args.
+        """
+        self.mgr.log.debug(f'Starting rgw migration (queue length is {len(self.rgw_migration_queue)})')
+        for s in self.rgw_migration_queue:
+            spec = s['spec']
+            if self.rgw_spec_needs_migration(spec):
+                rgw_spec = self.migrate_rgw_spec(spec)
+                if rgw_spec is not None:
+                    logger.info(f"Migrating {spec} to new RGW with extra args format {rgw_spec}")
+                    self.mgr.spec_store.save(rgw_spec)
+            else:
+                logger.info(f"No Migration is needed for rgw spec: {spec}")
+        self.rgw_migration_queue = []
+        return True
+
+    def migrate_6_7(self) -> bool:
+        # start by placing certs/keys from rgw, iscsi, and ingress specs into cert store
+        for spec in self.mgr.spec_store.all_specs.values():
+            if spec.service_type in ['rgw', 'ingress', 'iscsi']:
+                logger.info(f'Migrating certs/keys for {spec.service_name()} spec to cert store')
+                self.mgr.spec_store._save_certs_and_keys(spec)
+
+        # grafana certs are stored based on the host they are placed on
+        for grafana_daemon in self.mgr.cache.get_daemons_by_type('grafana'):
+            logger.info(f'Checking for cert/key for {grafana_daemon.name()}')
+            hostname = grafana_daemon.hostname
+            assert hostname is not None  # for mypy
+            grafana_cert_path = f'{hostname}/grafana_crt'
+            grafana_key_path = f'{hostname}/grafana_key'
+            grafana_cert = self.mgr.get_store(grafana_cert_path)
+            if grafana_cert:
+                logger.info(f'Migrating {grafana_daemon.name()} cert to cert store')
+                self.mgr.cert_key_store.save_cert('grafana_cert', grafana_cert, host=hostname)
+            grafana_key = self.mgr.get_store(grafana_key_path)
+            if grafana_key:
+                logger.info(f'Migrating {grafana_daemon.name()} key to cert store')
+                self.mgr.cert_key_store.save_key('grafana_key', grafana_key, host=hostname)
+
+        # NOTE: prometheus, alertmanager, and node-exporter certs were not stored
+        # and appeared to just be generated at daemon deploy time if secure_monitoring_stack
+        # was set to true. Therefore we have nothing to migrate for those daemons
+        return True
+
+
+def queue_migrate_rgw_spec(mgr: "CephadmOrchestrator", spec_dict: Dict[Any, Any]) -> None:
+    """
+    As aprt of 17.2.6 a stricter RGW spec validation has been added so the field
+    rgw_frontend_type cannot be used to pass rgw-frontends parameters.
+    """
+    service_id = spec_dict['spec']['service_id']
+    queued = mgr.get_store('rgw_migration_queue') or '[]'
+    ls = json.loads(queued)
+    ls.append(spec_dict)
+    mgr.set_store('rgw_migration_queue', json.dumps(ls))
+    mgr.log.info(f'Queued rgw.{service_id} for migration')
 
 
 def queue_migrate_nfs_spec(mgr: "CephadmOrchestrator", spec_dict: Dict[Any, Any]) -> None:

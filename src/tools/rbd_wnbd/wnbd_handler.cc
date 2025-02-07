@@ -50,27 +50,47 @@ int WnbdHandler::wait()
 {
   int err = 0;
   if (started && wnbd_disk) {
-    dout(10) << __func__ << ": waiting" << dendl;
+    dout(10) << "waiting for WNBD mapping: " << instance_name << dendl;
 
     err = WnbdWaitDispatcher(wnbd_disk);
     if (err) {
-      derr << __func__ << " failed waiting for dispatcher to stop: "
-           << err << dendl;
+      derr << __func__ << ": failed waiting for dispatcher to stop: "
+           << instance_name
+           << ". Error: " << err << dendl;
+    } else {
+      dout(10) << "WNBD mapping disconnected: " << instance_name << dendl;
     }
   }
 
   return err;
 }
 
-int WnbdAdminHook::call (std::string_view command, const cmdmap_t& cmdmap,
-     Formatter *f,
-     std::ostream& errss,
-     bufferlist& out) {
-    if (command == "wnbd stats") {
-      return m_handler->dump_stats(f);
-    }
-    return -ENOSYS;
+WnbdAdminHook::WnbdAdminHook(WnbdHandler *handler, AdminSocket* admin_socket)
+  : m_handler(handler)
+  , m_admin_socket(admin_socket)
+{
+  if (m_admin_socket) {
+    m_admin_socket->register_command(
+      std::string("wnbd stats ") + m_handler->instance_name,
+      this, "get WNBD stats");
+  } else {
+    dout(0) << "no admin socket provided, skipped registering wnbd hooks"
+            << dendl;
   }
+}
+
+int WnbdAdminHook::call (
+  std::string_view command, const cmdmap_t& cmdmap,
+  const bufferlist&,
+  Formatter *f,
+  std::ostream& errss,
+  bufferlist& out)
+{
+  if (command == "wnbd stats " + m_handler->instance_name) {
+    return m_handler->dump_stats(f);
+  }
+  return -ENOSYS;
+}
 
 int WnbdHandler::dump_stats(Formatter *f)
 {
@@ -364,6 +384,27 @@ void WnbdHandler::LogMessage(
           << WnbdLogLevelToStr(LogLevel) << " " << Message << dendl;
 }
 
+int WnbdHandler::resize(uint64_t new_size)
+{
+  int err = 0;
+  
+  uint64_t new_block_count = new_size / block_size;
+
+  dout(5) << "Resizing disk. Block size: " << block_size
+          << ". New block count: " << new_block_count
+          << ". Old block count: "
+          << wnbd_disk->Properties.BlockCount << "." << dendl;
+  err = WnbdSetDiskSize(wnbd_disk, new_block_count);
+  if (err) {
+    derr << "WNBD: Setting disk size failed with error: "
+         << win32_strerror(err) << dendl;
+    return -EINVAL;
+  }
+
+  dout(5) << "Successfully resized disk to: " << new_block_count << " blocks"
+          << dendl;
+  return 0;
+}
 
 int WnbdHandler::start()
 {
@@ -385,7 +426,8 @@ int WnbdHandler::start()
     wnbd_props.Flags.FlushSupported = 1;
   }
 
-  err = WnbdCreate(&wnbd_props, &RbdWnbdInterface, this, &wnbd_disk);
+  err = WnbdCreate(&wnbd_props, (const PWNBD_INTERFACE) &RbdWnbdInterface,
+                   this, &wnbd_disk);
   if (err)
     goto exit;
 

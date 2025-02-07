@@ -29,6 +29,8 @@ Flag               Description                      Default value
 =================  ===============================  ===============================
 OS                 Host OS distribution, for mingw  ubuntu (also valid: suse)
                    and other OS specific settings.
+TOOLCHAIN          Mingw toolchain: mingw-llvm or   mingw-llvm
+                   mingw-gcc.
 CEPH_DIR           The Ceph source code directory.  The same as the script.
 BUILD_DIR          The directory where the          $CEPH_DIR/build
                    generated artifacts will be
@@ -52,7 +54,7 @@ EMBEDDED_DBG_SYM   By default, the generated
                    symbols. If this flag is set,
                    the debug symbols will remain
                    embedded in the executables.
-ENABLE_SHARED      Dynamically link Ceph libs.      False
+ENABLE_SHARED      Dynamically link Ceph libs.      ON
 =================  ===============================  ===============================
 
 The following command will build the binaries and add them to a zip archive
@@ -103,8 +105,7 @@ In order to mount Ceph filesystems, you will have to install Dokany.
 You may fetch the installer as well as the source code from the Dokany
 Github repository: https://github.com/dokan-dev/dokany/releases
 
-The minimum supported Dokany version is 1.3.1. At the time of the writing,
-Dokany 2.0 is in Beta stage and is unsupported.
+Make sure to install Dokany 2.0.5 or later.
 
 In order to map RBD images, the ``WNBD`` driver must be installed. Please
 check out this page for more details about ``WNBD`` and the install process:

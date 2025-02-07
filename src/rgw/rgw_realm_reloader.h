@@ -1,12 +1,16 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#ifndef RGW_REALM_RELOADER_H
-#define RGW_REALM_RELOADER_H
+#pragma once
+
+#include <boost/asio/io_context.hpp>
 
 #include "rgw_realm_watcher.h"
 #include "common/Cond.h"
 #include "rgw_sal_fwd.h"
+
+struct RGWProcessEnv;
+namespace rgw::auth { class ImplicitTenants; }
 
 /**
  * RGWRealmReloader responds to new period notifications by recreating RGWRados
@@ -28,11 +32,13 @@ class RGWRealmReloader : public RGWRealmWatcher::Watcher {
     /// pause all frontends while realm reconfiguration is in progress
     virtual void pause() = 0;
     /// resume all frontends with the given RGWRados instance
-    virtual void resume(rgw::sal::Store* store) = 0;
+    virtual void resume(rgw::sal::Driver* driver) = 0;
   };
 
-  RGWRealmReloader(rgw::sal::Store*& store, std::map<std::string, std::string>& service_map_meta,
-                   Pauser* frontends);
+  RGWRealmReloader(RGWProcessEnv& env,
+                   const rgw::auth::ImplicitTenants& implicit_tenants,
+                   std::map<std::string, std::string>& service_map_meta,
+                   Pauser* frontends, boost::asio::io_context& io_context);
   ~RGWRealmReloader() override;
 
   /// respond to realm notifications by scheduling a reload()
@@ -44,10 +50,11 @@ class RGWRealmReloader : public RGWRealmWatcher::Watcher {
 
   class C_Reload; //< Context that calls reload()
 
-  /// main()'s Store pointer as a reference, modified by reload()
-  rgw::sal::Store*& store;
+  RGWProcessEnv& env;
+  const rgw::auth::ImplicitTenants& implicit_tenants;
   std::map<std::string, std::string>& service_map_meta;
   Pauser *const frontends;
+  boost::asio::io_context& io_context;
 
   /// reload() takes a significant amount of time, so we don't want to run
   /// it in the handle_notify() thread. we choose a timer thread instead of a
@@ -58,5 +65,3 @@ class RGWRealmReloader : public RGWRealmWatcher::Watcher {
   ceph::condition_variable cond; //< to signal reload() after an invalid realm config
   C_Reload* reload_scheduled; //< reload() context if scheduled
 };
-
-#endif // RGW_REALM_RELOADER_H

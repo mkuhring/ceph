@@ -33,16 +33,26 @@ namespace crimson::os::seastore {
  * mutation which changes the journal trim bound.
  */
 struct RootBlock : CachedExtent {
-  constexpr static seastore_off_t SIZE = 4<<10;
+  constexpr static extent_len_t SIZE = 4<<10;
   using Ref = TCachedExtentRef<RootBlock>;
 
   root_t root;
 
-  RootBlock() : CachedExtent(0) {}
+  CachedExtent* lba_root_node = nullptr;
+  CachedExtent* backref_root_node = nullptr;
 
-  RootBlock(const RootBlock &rhs) = default;
+  RootBlock() : CachedExtent(root_construct_t()) {};
 
-  CachedExtentRef duplicate_for_write() final {
+  RootBlock(const RootBlock &rhs)
+    : CachedExtent(rhs),
+      root(rhs.root),
+      lba_root_node(nullptr),
+      backref_root_node(nullptr)
+  {}
+
+  void on_rewrite(Transaction&, CachedExtent&, extent_len_t) final {}
+
+  CachedExtentRef duplicate_for_write(Transaction&) final {
     return CachedExtentRef(new RootBlock(*this));
   };
 
@@ -50,6 +60,8 @@ struct RootBlock : CachedExtent {
   extent_types_t get_type() const final {
     return extent_types_t::ROOT;
   }
+
+  void on_replace_prior() final;
 
   /// dumps root as delta
   ceph::bufferlist get_delta() final {
@@ -84,7 +96,16 @@ struct RootBlock : CachedExtent {
 
   root_t &get_root() { return root; }
 
+  std::ostream &print_detail(std::ostream &out) const final {
+    return out << ", root_block(lba_root_node=" << (void*)lba_root_node
+	       << ", backref_root_node=" << (void*)backref_root_node
+	       << ")";
+  }
 };
 using RootBlockRef = RootBlock::Ref;
 
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::os::seastore::RootBlock> : fmt::ostream_formatter {};
+#endif

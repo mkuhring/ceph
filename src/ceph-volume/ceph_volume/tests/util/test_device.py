@@ -1,3 +1,4 @@
+#  type: ignore
 import os
 import pytest
 from copy import deepcopy
@@ -47,7 +48,8 @@ class TestDevice(object):
         disk = device.Device("/dev/sda")
         assert disk.lvm_size.gb == 4
 
-    def test_is_lv(self, fake_call, device_info):
+    def test_is_lv(self, fake_call, device_info, monkeypatch):
+        monkeypatch.setattr('ceph_volume.util.device.Device.is_lv', lambda: True)
         data = {"lv_path": "vg/lv", "vg_name": "vg", "name": "lv"}
         lsblk = {"TYPE": "lvm", "NAME": "vg-lv"}
         device_info(lv=data,lsblk=lsblk)
@@ -153,14 +155,6 @@ class TestDevice(object):
         assert disk.is_device is True
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
-    def test_is_partition(self, fake_call, device_info):
-        data = {"/dev/sda1": {"foo": "bar"}}
-        lsblk = {"TYPE": "part", "NAME": "sda1", "PKNAME": "sda"}
-        device_info(devices=data, lsblk=lsblk)
-        disk = device.Device("/dev/sda1")
-        assert disk.is_partition
-
-    @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
     def test_mpath_device_is_device(self, fake_call, device_info):
         data = {"/dev/foo": {"foo": "bar"}}
         lsblk = {"TYPE": "mpath", "NAME": "foo"}
@@ -241,7 +235,7 @@ class TestDevice(object):
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
     def test_reject_removable_device(self, fake_call, device_info):
-        data = {"/dev/sdb": {"removable": 1}}
+        data = {"/dev/sdb": {"removable": "1"}}
         lsblk = {"TYPE": "disk", "NAME": "sdb"}
         device_info(devices=data,lsblk=lsblk)
         disk = device.Device("/dev/sdb")
@@ -249,7 +243,7 @@ class TestDevice(object):
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
     def test_reject_device_with_gpt_headers(self, fake_call, device_info):
-        data = {"/dev/sdb": {"removable": 0, "size": 5368709120}}
+        data = {"/dev/sdb": {"removable": "0", "size": 5368709120}}
         lsblk = {"TYPE": "disk", "NAME": "sdb"}
         blkid= {"PTTYPE": "gpt"}
         device_info(
@@ -262,7 +256,7 @@ class TestDevice(object):
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
     def test_accept_non_removable_device(self, fake_call, device_info):
-        data = {"/dev/sdb": {"removable": 0, "size": 5368709120}}
+        data = {"/dev/sdb": {"removable": "0", "size": 5368709120}}
         lsblk = {"TYPE": "disk", "NAME": "sdb"}
         device_info(devices=data,lsblk=lsblk)
         disk = device.Device("/dev/sdb")
@@ -286,7 +280,7 @@ class TestDevice(object):
                                       fake_call):
         m_os_path_islink.return_value = True
         m_os_path_realpath.return_value = '/dev/sdb'
-        data = {"/dev/sdb": {"ro": 0, "size": 5368709120}}
+        data = {"/dev/sdb": {"ro": "0", "size": 5368709120}}
         lsblk = {"TYPE": "disk"}
         device_info(devices=data,lsblk=lsblk)
         disk = device.Device("/dev/test_symlink")
@@ -304,7 +298,7 @@ class TestDevice(object):
                                              fake_call):
         m_os_path_islink.return_value = True
         m_os_readlink.return_value = '/dev/dm-0'
-        data = {"/dev/mapper/mpatha": {"ro": 0, "size": 5368709120}}
+        data = {"/dev/mapper/mpatha": {"ro": "0", "size": 5368709120}}
         lsblk = {"TYPE": "disk"}
         device_info(devices=data,lsblk=lsblk)
         disk = device.Device("/dev/mapper/mpatha")
@@ -312,11 +306,27 @@ class TestDevice(object):
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
     def test_reject_readonly_device(self, fake_call, device_info):
-        data = {"/dev/cdrom": {"ro": 1}}
+        data = {"/dev/cdrom": {"ro": "1"}}
         lsblk = {"TYPE": "disk", "NAME": "cdrom"}
         device_info(devices=data,lsblk=lsblk)
         disk = device.Device("/dev/cdrom")
         assert not disk.available
+
+    @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
+    @patch('ceph_volume.util.device.os.path.realpath')
+    @patch('ceph_volume.util.device.os.path.islink')
+    def test_reject_lv_symlink_to_device(self,
+                                         m_os_path_islink,
+                                         m_os_path_realpath,
+                                         device_info,
+                                         fake_call):
+        m_os_path_islink.return_value = True
+        m_os_path_realpath.return_value = '/dev/mapper/vg-lv'
+        lv = {"lv_path": "/dev/vg/lv", "vg_name": "vg", "name": "lv"}
+        lsblk = {"TYPE": "lvm", "NAME": "vg-lv"}
+        device_info(lv=lv,lsblk=lsblk)
+        disk = device.Device("/dev/vg/lv")
+        assert disk.path == '/dev/vg/lv'
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
     def test_reject_smaller_than_5gb(self, fake_call, device_info):
@@ -328,7 +338,7 @@ class TestDevice(object):
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
     def test_accept_non_readonly_device(self, fake_call, device_info):
-        data = {"/dev/sda": {"ro": 0, "size": 5368709120}}
+        data = {"/dev/sda": {"ro": "0", "size": 5368709120}}
         lsblk = {"TYPE": "disk", "NAME": "sda"}
         device_info(devices=data,lsblk=lsblk)
         disk = device.Device("/dev/sda")
@@ -536,7 +546,8 @@ class TestDeviceEncryption(object):
         assert disk.is_encrypted is False
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
-    def test_lv_is_encrypted_blkid(self, fake_call, device_info):
+    def test_lv_is_encrypted_blkid(self, fake_call, device_info, monkeypatch):
+        monkeypatch.setattr('ceph_volume.util.device.Device.is_lv', lambda: True)
         lsblk = {'TYPE': 'lvm', 'NAME': 'sda'}
         blkid = {'TYPE': 'crypto_LUKS'}
         device_info(lsblk=lsblk, blkid=blkid)
@@ -545,7 +556,8 @@ class TestDeviceEncryption(object):
         assert disk.is_encrypted is True
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
-    def test_lv_is_not_encrypted_blkid(self, fake_call, factory, device_info):
+    def test_lv_is_not_encrypted_blkid(self, fake_call, factory, device_info, monkeypatch):
+        monkeypatch.setattr('ceph_volume.util.device.Device.is_lv', lambda: True)
         lsblk = {'TYPE': 'lvm', 'NAME': 'sda'}
         blkid = {'TYPE': 'xfs'}
         device_info(lsblk=lsblk, blkid=blkid)
@@ -554,7 +566,8 @@ class TestDeviceEncryption(object):
         assert disk.is_encrypted is False
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
-    def test_lv_is_encrypted_lsblk(self, fake_call, device_info):
+    def test_lv_is_encrypted_lsblk(self, fake_call, device_info, monkeypatch):
+        monkeypatch.setattr('ceph_volume.util.device.Device.is_lv', lambda: True)
         lsblk = {'FSTYPE': 'crypto_LUKS', 'NAME': 'sda', 'TYPE': 'lvm'}
         blkid = {'TYPE': 'mapper'}
         device_info(lsblk=lsblk, blkid=blkid)
@@ -563,7 +576,8 @@ class TestDeviceEncryption(object):
         assert disk.is_encrypted is True
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
-    def test_lv_is_not_encrypted_lsblk(self, fake_call, factory, device_info):
+    def test_lv_is_not_encrypted_lsblk(self, fake_call, factory, device_info, monkeypatch):
+        monkeypatch.setattr('ceph_volume.util.device.Device.is_lv', lambda: True)
         lsblk = {'FSTYPE': 'xfs', 'NAME': 'sda', 'TYPE': 'lvm'}
         blkid = {'TYPE': 'mapper'}
         device_info(lsblk=lsblk, blkid=blkid)
@@ -572,16 +586,18 @@ class TestDeviceEncryption(object):
         assert disk.is_encrypted is False
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
-    def test_lv_is_encrypted_lvm_api(self, fake_call, factory, device_info):
+    def test_lv_is_encrypted_lvm_api(self, fake_call, factory, device_info, monkeypatch):
+        monkeypatch.setattr('ceph_volume.util.device.Device.is_lv', lambda: True)
         lsblk = {'FSTYPE': 'xfs', 'NAME': 'sda', 'TYPE': 'lvm'}
         blkid = {'TYPE': 'mapper'}
         device_info(lsblk=lsblk, blkid=blkid)
         disk = device.Device("/dev/sda")
-        disk.lv_api = factory(encrypted=True)
+        disk.lv_api = api.Volume(**{'lv_name': 'lv1', 'lv_tags': 'ceph.encrypted=1'})
         assert disk.is_encrypted is True
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)
-    def test_lv_is_not_encrypted_lvm_api(self, fake_call, factory, device_info):
+    def test_lv_is_not_encrypted_lvm_api(self, fake_call, factory, device_info, monkeypatch):
+        monkeypatch.setattr('ceph_volume.util.device.Device.is_lv', lambda: True)
         lsblk = {'FSTYPE': 'xfs', 'NAME': 'sda', 'TYPE': 'lvm'}
         blkid = {'TYPE': 'mapper'}
         device_info(lsblk=lsblk, blkid=blkid)
@@ -592,12 +608,12 @@ class TestDeviceEncryption(object):
 
 class TestDeviceOrdering(object):
 
-    def setup(self):
+    def setup_method(self):
         self.data = {
-                "/dev/sda": {"removable": 0},
-                "/dev/sdb": {"removable": 1}, # invalid
-                "/dev/sdc": {"removable": 0},
-                "/dev/sdd": {"removable": 1}, # invalid
+                "/dev/sda": {"removable": "0"},
+                "/dev/sdb": {"removable": "1"}, # invalid
+                "/dev/sdc": {"removable": "0"},
+                "/dev/sdd": {"removable": "1"}, # invalid
         }
 
     @patch("ceph_volume.util.disk.has_bluestore_label", lambda x: False)

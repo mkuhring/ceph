@@ -198,6 +198,7 @@ class ClusterSocketHook : public AdminSocketHook {
 public:
   explicit ClusterSocketHook(ClusterState *o) : cluster_state(o) {}
   int call(std::string_view admin_command, const cmdmap_t& cmdmap,
+	   const bufferlist&,
 	   Formatter *f,
 	   std::ostream& errss,
 	   bufferlist& out) override {
@@ -224,14 +225,6 @@ void ClusterState::final_init()
   ceph_assert(r == 0);
 }
 
-void ClusterState::shutdown()
-{
-  // unregister commands
-  g_ceph_context->get_admin_socket()->unregister_commands(asok_hook);
-  delete asok_hook;
-  asok_hook = NULL;
-}
-
 bool ClusterState::asok_command(
   std::string_view admin_command,
   const cmdmap_t& cmdmap,
@@ -239,6 +232,7 @@ bool ClusterState::asok_command(
   ostream& ss)
 {
   std::lock_guard l(lock);
+
   if (admin_command == "dump_osd_network") {
     int64_t value = 0;
     // Default to health warning level if nothing specified

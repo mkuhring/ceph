@@ -14,13 +14,17 @@
  */
 
 #include "common/perf_counters.h"
+#include "common/perf_counters_key.h"
 #include "common/dout.h"
 #include "common/valgrind.h"
 #include "include/common_fwd.h"
+#include "include/utime.h"
 
 using std::ostringstream;
 using std::make_pair;
 using std::pair;
+
+using namespace std::literals;
 
 namespace TOPNSPC::common {
 PerfCountersCollectionImpl::PerfCountersCollectionImpl()
@@ -35,81 +39,56 @@ PerfCountersCollectionImpl::~PerfCountersCollectionImpl()
 void PerfCountersCollectionImpl::add(PerfCounters *l)
 {
   // make sure the name is unique
-  perf_counters_set_t::iterator i;
-  i = m_loggers.find(l);
-  while (i != m_loggers.end()) {
-    ostringstream ss;
-    ss << l->get_name() << "-" << (void*)l;
-    l->set_name(ss.str());
-    i = m_loggers.find(l);
+  while (m_loggers.contains(l)) {
+    l->set_name(fmt::format("{}-{:p}", l->get_name(), (void *)l));
   }
 
   m_loggers.insert(l);
 
-  for (unsigned int i = 0; i < l->m_data.size(); ++i) {
-    PerfCounters::perf_counter_data_any_d &data = l->m_data[i];
-
-    std::string path = l->get_name();
-    path += ".";
-    path += data.name;
-
-    by_path[path] = {&data, l};
+  const auto rc_name = l->get_name();
+  for (auto& dt: l->m_data) {
+    const auto path = rc_name + "." + dt.name;
+    by_path[path] = {&dt, l};
   }
 }
 
 void PerfCountersCollectionImpl::remove(PerfCounters *l)
 {
-  for (unsigned int i = 0; i < l->m_data.size(); ++i) {
-    PerfCounters::perf_counter_data_any_d &data = l->m_data[i];
-
-    std::string path = l->get_name();
-    path += ".";
-    path += data.name;
-
+  const auto rc_name = l->get_name();
+  for (const auto& dt: l->m_data) {
+    const auto path = rc_name + "." + dt.name;
     by_path.erase(path);
   }
 
-  perf_counters_set_t::iterator i = m_loggers.find(l);
-  ceph_assert(i != m_loggers.end());
-  m_loggers.erase(i);
+  [[maybe_unused]] const auto rm_cnt = m_loggers.erase(l);
+  ceph_assert(rm_cnt == 1);
 }
 
 void PerfCountersCollectionImpl::clear()
 {
-  perf_counters_set_t::iterator i = m_loggers.begin();
-  perf_counters_set_t::iterator i_end = m_loggers.end();
-  for (; i != i_end; ) {
-    delete *i;
-    m_loggers.erase(i++);
+  for (auto& l : m_loggers) {
+    delete l;
   }
-
+  m_loggers.clear();
   by_path.clear();
 }
 
-bool PerfCountersCollectionImpl::reset(const std::string &name)
+bool PerfCountersCollectionImpl::reset(std::string_view name)
 {
-  bool result = false;
-  perf_counters_set_t::iterator i = m_loggers.begin();
-  perf_counters_set_t::iterator i_end = m_loggers.end();
-
-  if (!strcmp(name.c_str(), "all"))  {
-    while (i != i_end) {
-      (*i)->reset();
-      ++i;
+  if (name == "all"sv) {
+    for (auto& dt: m_loggers) {
+      dt->reset();
     }
-    result = true;
-  } else {
-    while (i != i_end) {
-      if (!name.compare((*i)->get_name())) {
-	(*i)->reset();
-	result = true;
-	break;
-      }
-      ++i;
-    }
+    return true;
   }
 
-  return result;
+  auto dt = m_loggers.find(name);
+  if (dt == m_loggers.end()) {
+    return false;
+  }
+
+  (*dt)->reset();
+  return true;
 }
 
 
@@ -129,16 +108,47 @@ void PerfCountersCollectionImpl::dump_formatted_generic(
     Formatter *f,
     bool schema,
     bool histograms,
+    select_labeled_t dump_labeled,
     const std::string &logger,
     const std::string &counter) const
 {
   f->open_object_section("perfcounter_collection");
-  
-  for (perf_counters_set_t::iterator l = m_loggers.begin();
-       l != m_loggers.end(); ++l) {
-    // Optionally filter on logger name, pass through counter filter
-    if (logger.empty() || (*l)->get_name() == logger) {
-      (*l)->dump_formatted_generic(f, schema, histograms, counter);
+
+  if (dump_labeled == select_labeled_t::labeled) {
+    std::string prev_key_name;
+    for (auto l = m_loggers.begin(); l != m_loggers.end(); ++l) {
+      std::string_view key_name = ceph::perf_counters::key_name((*l)->get_name());
+      if (key_name != prev_key_name) {
+        // close previous set of counters before dumping new one
+        if (!prev_key_name.empty()) {
+          f->close_section(); // array section
+        }
+        prev_key_name = key_name;
+
+        f->open_array_section(key_name);
+        (*l)->dump_formatted_generic(f, schema, histograms, select_labeled_t::labeled, "");
+      } else {
+        (*l)->dump_formatted_generic(f, schema, histograms, select_labeled_t::labeled, "");
+      }
+    }
+    if (!m_loggers.empty()) {
+      f->close_section(); // final array section
+    }
+  } else {
+    // unlabeled
+    if (logger.empty()) {
+      // dump all loggers
+      for (auto& l : m_loggers) {
+        l->dump_formatted_generic(f, schema, histograms,
+                                  select_labeled_t::unlabeled, counter);
+      }
+    } else {
+      // dump only specified logger
+      auto l = m_loggers.find(logger);
+      if (l != m_loggers.end()) {
+        (*l)->dump_formatted_generic(f, schema, histograms,
+                                     select_labeled_t::unlabeled, counter);
+      }
     }
   }
   f->close_section();
@@ -353,11 +363,32 @@ void PerfCounters::reset()
   }
 }
 
+
 void PerfCounters::dump_formatted_generic(Formatter *f, bool schema,
-    bool histograms, const std::string &counter) const
+    bool histograms, select_labeled_t dump_labeled,
+    const std::string &counter) const
 {
-  f->open_object_section(m_name.c_str());
-  
+  if (dump_labeled == select_labeled_t::labeled) {
+    f->open_object_section(""); // should be enclosed by array
+    f->open_object_section("labels");
+    for (auto label : ceph::perf_counters::key_labels(m_name)) {
+      // don't dump labels with empty label names
+      if (!label.first.empty()) {
+        f->dump_string(label.first, label.second);
+      }
+    }
+    f->close_section(); // labels
+    f->open_object_section("counters");
+  } else {
+    auto labels = ceph::perf_counters::key_labels(m_name);
+    // do not dump counters when counter instance is labeled and dump_labeled is not set
+    if (labels.begin() != labels.end()) {
+      return;
+    }
+
+    f->open_object_section(m_name.c_str());
+  }
+
   for (perf_counter_data_vec_t::const_iterator d = m_data.begin();
        d != m_data.end(); ++d) {
     if (!counter.empty() && counter != d->name) {
@@ -411,7 +442,7 @@ void PerfCounters::dump_formatted_generic(Formatter *f, bool schema,
         f->dump_string("nick", "");
       }
       f->dump_int("priority", get_adjusted_priority(d->prio));
-      
+
       if (d->unit == UNIT_NONE) {
 	f->dump_string("units", "none"); 
       } else if (d->unit == UNIT_BYTES) {
@@ -463,6 +494,9 @@ void PerfCounters::dump_formatted_generic(Formatter *f, bool schema,
 	}
       }
     }
+  }
+  if (dump_labeled == select_labeled_t::labeled) {
+    f->close_section(); // counters
   }
   f->close_section();
 }

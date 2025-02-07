@@ -7,7 +7,8 @@ html {
 
 html,
 body {
-  font-size: 12px;
+  // WARNING: This was clashing with Carbon's font-size
+  font-size: 16px;
   height: 100%;
   width: 100%;
 }
@@ -107,37 +108,13 @@ mark {
   border-left: 1px solid vv.$gray-400;
 }
 
-.accordion {
-  .card {
-    border: 0;
-  }
+a.nav-link {
+  color: vv.$primary;
+}
 
-  .card-header {
-    border: 0;
-    border-bottom: 3px solid vv.$white;
-    padding-left: 0;
-
-    .btn:focus,
-    .btn.focus {
-      box-shadow: none;
-    }
-
-    button.dropdown-toggle {
-      position: relative;
-
-      &::after {
-        border: 0;
-        content: '\f054';
-        font-family: 'ForkAwesome';
-        font-size: 1rem;
-        position: absolute;
-        right: 20px;
-        transition: transform 0.3s ease-in-out;
-      }
-
-      &[aria-expanded='true']::after {
-        transform: rotate(90deg);
-      }
-    }
-  }
+// Should be removed once bootstrap is completely removed from the code
+// for more info: https://github.com/ceph/ceph/pull/58478#pullrequestreview-2254120764
+ol,
+ul {
+  padding-left: 0;
 }

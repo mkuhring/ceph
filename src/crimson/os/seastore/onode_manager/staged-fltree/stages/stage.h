@@ -1443,7 +1443,7 @@ struct staged {
         if constexpr (NODE_TYPE == node_type_t::LEAF) {
           os << *value_ptr;
         } else {
-          os << "0x" << std::hex << value_ptr->value << std::dec;
+          os << laddr_t(value_ptr->value);
         }
         os << " " << size << "B"
            << "  @" << offset << "B";
@@ -1669,27 +1669,30 @@ struct staged {
         }
       }
     }
-    std::ostream& print(std::ostream& os, bool is_top) const {
+
+    template<typename OutputIt>
+    auto do_format_to(OutputIt out, bool is_top) const {
       if (valid()) {
         if (iter->is_end()) {
-          return os << "END";
+          return fmt::format_to(out, "END");
         } else {
-          os << index();
+          out = fmt::format_to(out, "{}", index());
         }
       } else {
         if (is_top) {
-          return os << "invalid StagedIterator!";
+          return fmt::format_to(out, "invalid StagedIterator!");
         } else {
-          os << "0!";
+          out = fmt::format_to(out, "0!");
         }
       }
       if constexpr (!IS_BOTTOM) {
-        os << ", ";
-        return this->_nxt.print(os, false);
+        out = fmt::format_to(out, ", ");
+        return this->_nxt.do_format_to(out, false);
       } else {
-        return os;
+        return out;
       }
     }
+
     position_t get_pos() const {
       if (valid()) {
         if constexpr (IS_BOTTOM) {
@@ -1726,9 +1729,6 @@ struct staged {
         }
       }
       return ret;
-    }
-    friend std::ostream& operator<<(std::ostream& os, const StagedIterator& iter) {
-      return iter.print(os, true);
     }
    private:
     std::optional<iterator_t> iter;
@@ -2474,4 +2474,19 @@ struct _node_to_stage_t<NodeType,
 template <typename NodeType>
 using node_to_stage_t = typename _node_to_stage_t<NodeType>::type;
 
+}
+
+template<typename T>
+concept HasDoFormatTo = requires(T x, std::back_insert_iterator<fmt::memory_buffer> out) {
+  { x.do_format_to(out, true) } -> std::same_as<decltype(out)>;
+};
+namespace fmt {
+// placed in the fmt namespace due to an ADL bug in g++ < 12
+// (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92944).
+template <HasDoFormatTo T> struct formatter<T> : formatter<std::string_view> {
+  template <typename FormatContext>
+  auto format(const T& staged_iterator, FormatContext& ctx) const {
+    return staged_iterator.do_format_to(ctx.out(), true);
+  }
+};
 }

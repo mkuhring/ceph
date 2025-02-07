@@ -1,7 +1,5 @@
 import { Component, Input } from '@angular/core';
 
-import { Icons } from '~/app/shared/enum/icons.enum';
-
 @Component({
   selector: 'cd-helper',
   templateUrl: './helper.component.html',
@@ -12,7 +10,8 @@ export class HelperComponent {
   class: string;
 
   @Input()
-  html: any;
+  iconClass = '';
 
-  icons = Icons;
+  @Input()
+  html: any;
 }

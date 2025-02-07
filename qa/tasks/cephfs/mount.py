@@ -21,14 +21,14 @@ from tasks.cephfs.filesystem import Filesystem
 
 log = logging.getLogger(__name__)
 
-
 UMOUNT_TIMEOUT = 300
 
 
-class CephFSMount(object):
+class CephFSMountBase(object):
     def __init__(self, ctx, test_dir, client_id, client_remote,
                  client_keyring_path=None, hostfs_mntpt=None,
-                 cephfs_name=None, cephfs_mntpt=None, brxnet=None):
+                 cephfs_name=None, cephfs_mntpt=None, brxnet=None,
+                 client_config=None):
         """
         :param test_dir: Global teuthology test dir
         :param client_id: Client ID, the 'foo' in client.foo
@@ -49,20 +49,33 @@ class CephFSMount(object):
                            hostfs_mntpt=hostfs_mntpt, cephfs_name=cephfs_name,
                            cephfs_mntpt=cephfs_mntpt)
 
+        if client_config is None:
+            client_config = {}
+        self.client_config = client_config
+
+        self.cephfs_name = cephfs_name
         self.client_id = client_id
         self.client_keyring_path = client_keyring_path
         self.client_remote = client_remote
-        if hostfs_mntpt:
+        self.cluster_name = 'ceph' # TODO: use config['cluster']
+        self.fs = None
+
+        if cephfs_mntpt is None and client_config.get("mount_path"):
+            self.cephfs_mntpt = client_config.get("mount_path")
+            log.info(f"using client_config[\"cephfs_mntpt\"] = {self.cephfs_mntpt}")
+        else:
+            self.cephfs_mntpt = cephfs_mntpt
+        log.info(f"cephfs_mntpt = {self.cephfs_mntpt}")
+
+        if hostfs_mntpt is None and client_config.get("mountpoint"):
+            self.hostfs_mntpt = client_config.get("mountpoint")
+            log.info(f"using client_config[\"hostfs_mntpt\"] = {self.hostfs_mntpt}")
+        elif hostfs_mntpt is not None:
             self.hostfs_mntpt = hostfs_mntpt
-            self.hostfs_mntpt_dirname = os.path.basename(self.hostfs_mntpt)
         else:
             self.hostfs_mntpt = os.path.join(self.test_dir, f'mnt.{self.client_id}')
-        self.cephfs_name = cephfs_name
-        self.cephfs_mntpt = cephfs_mntpt
-
-        self.cluster_name = 'ceph' # TODO: use config['cluster']
-
-        self.fs = None
+        self.hostfs_mntpt_dirname = os.path.basename(self.hostfs_mntpt)
+        log.info(f"hostfs_mntpt = {self.hostfs_mntpt}")
 
         self._netns_name = None
         self.nsid = -1
@@ -108,7 +121,7 @@ class CephFSMount(object):
 
     @property
     def mountpoint(self):
-        if self.hostfs_mntpt == None:
+        if self.hostfs_mntpt is None:
             self.hostfs_mntpt = os.path.join(self.test_dir,
                                              self.hostfs_mntpt_dirname)
         return self.hostfs_mntpt
@@ -147,6 +160,9 @@ class CephFSMount(object):
         """
         if not self.client_id or not self.client_remote or \
            not self.hostfs_mntpt:
+            log.error(f"self.client_id = {self.client_id}")
+            log.error(f"self.client_remote = {self.client_remote}")
+            log.error(f"self.hostfs_mntpt = {self.hostfs_mntpt}")
             errmsg = ('Mounting CephFS requires that at least following '
                       'details to be provided -\n'
                       '1. the client ID,\n2. the mountpoint and\n'
@@ -168,9 +184,44 @@ class CephFSMount(object):
                      get_file(self.client_remote, self.client_keyring_path,
                               sudo=True).decode())
 
+    def is_blocked(self):
+        self.fs = Filesystem(self.ctx, name=self.cephfs_name)
+
+        try:
+            output = self.fs.get_ceph_cmd_stdout('osd blocklist ls')
+        except CommandFailedError:
+            # Fallback for older Ceph cluster
+            output = self.fs.get_ceph_cmd_stdout('osd blacklist ls')
+
+        return self.addr in output
+
+    def is_stuck(self):
+        """
+        Check if mount is stuck/in a hanged state.
+        """
+        if not self.is_mounted():
+            return False
+
+        retval = self.client_remote.run(args=f'sudo stat {self.hostfs_mntpt}',
+                                        omit_sudo=False, wait=False).returncode
+        if retval == 0:
+            return False
+
+        time.sleep(10)
+        proc = self.client_remote.run(args='ps -ef', stdout=StringIO())
+        # if proc was running even after 10 seconds, it has to be stuck.
+        if f'stat {self.hostfs_mntpt}' in proc.stdout.getvalue():
+            log.critical('client mounted at self.hostfs_mntpt is stuck!')
+            return True
+        return False
+
     def is_mounted(self):
-        return self.hostfs_mntpt in \
-            self.client_remote.read_file('/proc/self/mounts',stdout=StringIO())
+        file = self.client_remote.read_file('/proc/self/mounts',stdout=StringIO())
+        if self.hostfs_mntpt in file:
+            return True
+        else:
+            log.debug(f"not mounted; /proc/self/mounts is:\n{file}")
+            return False
 
     def setupfs(self, name=None):
         if name is None and self.fs is not None:
@@ -453,6 +504,19 @@ class CephFSMount(object):
         self.mount(**kwargs)
         self.wait_until_mounted()
 
+    def _run_umount_lf(self):
+        log.debug(f'Force/lazy unmounting on client.{self.client_id}')
+
+        try:
+            proc = self.client_remote.run(
+                args=f'sudo umount --lazy --force {self.hostfs_mntpt}',
+                timeout=UMOUNT_TIMEOUT, omit_sudo=False)
+        except CommandFailedError:
+            if self.is_mounted():
+                raise
+
+        return proc
+
     def umount(self):
         raise NotImplementedError()
 
@@ -480,30 +544,21 @@ class CephFSMount(object):
                 raise RuntimeError('value of attributes should be either str '
                                    f'or None. {k} - {v}')
 
-    def update_attrs(self, client_id=None, client_keyring_path=None,
-                     client_remote=None, hostfs_mntpt=None, cephfs_name=None,
-                     cephfs_mntpt=None):
-        if not (client_id or client_keyring_path or client_remote or
-                cephfs_name or cephfs_mntpt or hostfs_mntpt):
-            return
+    def update_attrs(self, **kwargs):
+        verify_keys = [
+          'client_id',
+          'client_keyring_path',
+          'hostfs_mntpt',
+          'cephfs_name',
+          'cephfs_mntpt',
+        ]
 
-        self._verify_attrs(client_id=client_id,
-                           client_keyring_path=client_keyring_path,
-                           hostfs_mntpt=hostfs_mntpt, cephfs_name=cephfs_name,
-                           cephfs_mntpt=cephfs_mntpt)
+        self._verify_attrs(**{key: kwargs[key] for key in verify_keys if key in kwargs})
 
-        if client_id:
-            self.client_id = client_id
-        if client_keyring_path:
-            self.client_keyring_path = client_keyring_path
-        if client_remote:
-            self.client_remote = client_remote
-        if hostfs_mntpt:
-            self.hostfs_mntpt = hostfs_mntpt
-        if cephfs_name:
-            self.cephfs_name = cephfs_name
-        if cephfs_mntpt:
-            self.cephfs_mntpt = cephfs_mntpt
+        for k in verify_keys:
+            v = kwargs.get(k)
+            if v is not None:
+                setattr(self, k, v)
 
     def remount(self, **kwargs):
         """
@@ -526,7 +581,7 @@ class CephFSMount(object):
 
         self.update_attrs(**kwargs)
 
-        retval = self.mount(mntopts=mntopts, check_status=check_status)
+        retval = self.mount(mntopts=mntopts, check_status=check_status, **kwargs)
         # avoid this scenario (again): mount command might've failed and
         # check_status might have silenced the exception, yet we attempt to
         # wait which might lead to an error.
@@ -669,15 +724,19 @@ class CephFSMount(object):
         if perms:
             self.run_shell(args=f'chmod {perms} {path}')
 
-    def read_file(self, path):
+    def read_file(self, path, sudo=False):
         """
         Return the data from the file on given path.
         """
         if path.find(self.hostfs_mntpt) == -1:
             path = os.path.join(self.hostfs_mntpt, path)
 
-        return self.run_shell(args=['cat', path]).\
-            stdout.getvalue().strip()
+        args = []
+        if sudo:
+            args.append('sudo')
+        args += ['cat', path]
+
+        return self.run_shell(args=args, omit_sudo=False).stdout.getvalue().strip()
 
     def create_destroy(self):
         assert(self.is_mounted())
@@ -692,36 +751,53 @@ class CephFSMount(object):
             'rm', '-f', os.path.join(self.hostfs_mntpt, filename)
         ])
 
-    def _run_python(self, pyscript, py_version='python3', sudo=False):
+    def _run_python(self, pyscript, py_version='python3', sudo=False, timeout=None):
         args, omit_sudo = [], True
         if sudo:
             args.append('sudo')
             omit_sudo = False
-        args += ['adjust-ulimits', 'daemon-helper', 'kill', py_version, '-c', pyscript]
+        timeout_args = ['--timeout', "%d" % timeout] if timeout is not None else []
+        args += ['stdin-killer', *timeout_args, '--', py_version, '-c', pyscript]
         return self.client_remote.run(args=args, wait=False, stdin=run.PIPE,
                                       stdout=StringIO(), omit_sudo=omit_sudo)
 
-    def run_python(self, pyscript, py_version='python3', sudo=False):
-        p = self._run_python(pyscript, py_version, sudo=sudo)
+    def run_python(self, pyscript, py_version='python3', sudo=False, timeout=None):
+        p = self._run_python(pyscript, py_version, sudo=sudo, timeout=timeout)
         p.wait()
         return p.stdout.getvalue().strip()
 
-    def run_shell(self, args, timeout=300, **kwargs):
-        omit_sudo = kwargs.pop('omit_sudo', False)
-        cwd = kwargs.pop('cwd', self.mountpoint)
-        stdout = kwargs.pop('stdout', StringIO())
-        stderr = kwargs.pop('stderr', StringIO())
+    def run_shell(self, args, **kwargs):
+        kwargs.setdefault('cwd', self.mountpoint)
+        kwargs.setdefault('omit_sudo', False)
+        kwargs.setdefault('stdout', StringIO())
+        kwargs.setdefault('stderr', StringIO())
+        kwargs.setdefault('timeout', 300)
 
-        return self.client_remote.run(args=args, cwd=cwd, timeout=timeout,
-                                      stdout=stdout, stderr=stderr,
-                                      omit_sudo=omit_sudo, **kwargs)
+        return self.client_remote.run(args=args, **kwargs)
 
-    def run_shell_payload(self, payload, **kwargs):
-        kwargs['args'] = ["bash", "-c", Raw(f"'{payload}'")]
+    def get_shell_stdout(self, args, timeout=300, **kwargs):
+        return self.run_shell(args=args, timeout=timeout, **kwargs).stdout.\
+            getvalue().strip()
+
+    def run_shell_payload(self, payload, wait=True, timeout=900, **kwargs):
+        kwargs.setdefault('cwd', self.mountpoint)
+        kwargs.setdefault('omit_sudo', False)
+        kwargs.setdefault('stdout', StringIO())
+        kwargs.setdefault('stderr', StringIO())
+        kwargs.setdefault('stdin', run.PIPE)
+        args = []
         if kwargs.pop('sudo', False):
-            kwargs['args'].insert(0, 'sudo')
+            args.append('sudo')
             kwargs['omit_sudo'] = False
-        return self.run_shell(**kwargs)
+        args.append("stdin-killer")
+        if timeout is not None:
+            args.append(f"--timeout={timeout}")
+        args += ("--", "bash", "-c", Raw(f"'{payload}'"))
+        p = self.client_remote.run(args=args, wait=False, **kwargs)
+        if wait:
+            p.stdin.close()
+            p.wait()
+        return p
 
     def run_as_user(self, **kwargs):
         """
@@ -815,6 +891,46 @@ class CephFSMount(object):
         self._verify(proc, retval, errmsgs)
         return proc
 
+    def open_for_reading(self, basename):
+        """
+        Open a file for reading only.
+        """
+        assert(self.is_mounted())
+
+        path = os.path.join(self.hostfs_mntpt, basename)
+
+        return self._run_python(dedent(
+            """
+            import os
+            mode = os.O_RDONLY
+            fd = os.open("{path}", mode)
+            os.close(fd)
+            """.format(path=path)
+        ))
+
+    def open_for_writing(self, basename, creat=True, trunc=True, excl=False):
+        """
+        Open a file for writing only.
+        """
+        assert(self.is_mounted())
+
+        path = os.path.join(self.hostfs_mntpt, basename)
+
+        return self._run_python(dedent(
+            """
+            import os
+            mode = os.O_WRONLY
+            if {creat}:
+                mode |= os.O_CREAT
+            if {trunc}:
+                mode |= os.O_TRUNC
+            if {excl}:
+                mode |= os.O_EXCL
+            fd = os.open("{path}", mode)
+            os.close(fd)
+            """.format(path=path, creat=creat, trunc=trunc, excl=excl)
+        ))
+
     def open_no_data(self, basename):
         """
         A pure metadata operation
@@ -830,7 +946,7 @@ class CephFSMount(object):
         ))
         p.wait()
 
-    def open_background(self, basename="background_file", write=True):
+    def open_background(self, basename="background_file", write=True, content="content"):
         """
         Open a file for writing, then block such that the client
         will hold a capability.
@@ -844,22 +960,43 @@ class CephFSMount(object):
 
         if write:
             pyscript = dedent("""
+                import fcntl
+                import os
+                import sys
                 import time
 
+                fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
+
                 with open("{path}", 'w') as f:
-                    f.write('content')
+                    f.write("{content}")
                     f.flush()
-                    f.write('content2')
                     while True:
-                        time.sleep(1)
-                """).format(path=path)
+                        print("open_background: keeping file open", file=sys.stderr)
+                        try:
+                             if os.read(0, 4096) == b"":
+                                  break
+                        except BlockingIOError:
+                            pass
+                        time.sleep(2)
+                """).format(path=path, content=content)
         else:
             pyscript = dedent("""
+                import fcntl
+                import os
+                import sys
                 import time
+
+                fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
 
                 with open("{path}", 'r') as f:
                     while True:
-                        time.sleep(1)
+                        print("open_background: keeping file open", file=sys.stderr)
+                        try:
+                             if os.read(0, 4096) == b"":
+                                  break
+                        except BlockingIOError:
+                            pass
+                        time.sleep(2)
                 """).format(path=path)
 
         rproc = self._run_python(pyscript)
@@ -868,7 +1005,10 @@ class CephFSMount(object):
         # This wait would not be sufficient if the file had already
         # existed, but it's simple and in practice users of open_background
         # are not using it on existing files.
-        self.wait_for_visible(basename)
+        if write:
+            self.wait_for_visible(basename, size=len(content))
+        else:
+            self.wait_for_visible(basename)
 
         return rproc
 
@@ -881,13 +1021,23 @@ class CephFSMount(object):
         path = os.path.join(self.hostfs_mntpt, basename)
 
         pyscript = dedent("""
+            import fcntl
+            import sys
             import time
             import os
+
+            fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
 
             os.mkdir("{path}")
             fd = os.open("{path}", os.O_RDONLY)
             while True:
-                time.sleep(1)
+                print("open_dir_background: keeping dir open", file=sys.stderr)
+                try:
+                     if os.read(0, 4096) == b"":
+                          break
+                except BlockingIOError:
+                    pass
+                time.sleep(2)
             """).format(path=path)
 
         rproc = self._run_python(pyscript)
@@ -906,19 +1056,27 @@ class CephFSMount(object):
                 if nr_links == 2:
                     return
 
-    def wait_for_visible(self, basename="background_file", timeout=30):
+    def wait_for_visible(self, basename="background_file", size=None, timeout=30):
         i = 0
+        args = ['stat']
+        if size is not None:
+            args += ['--printf=%s']
+        args += [os.path.join(self.hostfs_mntpt, basename)]
         while i < timeout:
-            r = self.client_remote.run(args=[
-                'stat', os.path.join(self.hostfs_mntpt, basename)
-            ], check_status=False)
-            if r.exitstatus == 0:
-                log.debug("File {0} became visible from {1} after {2}s".format(
-                    basename, self.client_id, i))
-                return
-            else:
-                time.sleep(1)
-                i += 1
+            p = self.client_remote.run(args=args, stdout=StringIO(), check_status=False)
+            if p.exitstatus == 0:
+                if size is not None:
+                    s = p.stdout.getvalue().strip()
+                    if int(s) == size:
+                        log.info(f"File {basename} became visible with size {size} from {self.client_id} after {i}s")
+                        return
+                    else:
+                        log.error(f"File {basename} became visible but with size {int(s)} not {size}")
+                else:
+                    log.info(f"File {basename} became visible from {self.client_id} after {i}s")
+                    return
+            time.sleep(1)
+            i += 1
 
         raise RuntimeError("Timed out after {0}s waiting for {1} to become visible from {2}".format(
             i, basename, self.client_id))
@@ -932,19 +1090,31 @@ class CephFSMount(object):
         path = os.path.join(self.hostfs_mntpt, basename)
 
         script_builder = """
+            import sys
             import time
             import fcntl
-            import struct"""
+            import os
+            import struct
+
+            fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
+        """
         if do_flock:
             script_builder += """
             f1 = open("{path}-1", 'w')
-            fcntl.flock(f1, fcntl.LOCK_EX | fcntl.LOCK_NB)"""
+            fcntl.flock(f1, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            """
         script_builder += """
             f2 = open("{path}-2", 'w')
             lockdata = struct.pack('hhllhh', fcntl.F_WRLCK, 0, 0, 0, 0, 0)
             fcntl.fcntl(f2, fcntl.F_SETLK, lockdata)
             while True:
-                time.sleep(1)
+                print("lock_background: keeping lock", file=sys.stderr)
+                try:
+                     if os.read(0, 4096) == b"":
+                          break
+                except BlockingIOError:
+                    pass
+                time.sleep(2)
             """
 
         pyscript = dedent(script_builder).format(path=path)
@@ -963,6 +1133,7 @@ class CephFSMount(object):
             import time
             import fcntl
             import struct
+            import sys
             f1 = open("{path}-1", 'w')
             fcntl.flock(f1, fcntl.LOCK_EX)
             f2 = open("{path}-2", 'w')
@@ -982,7 +1153,9 @@ class CephFSMount(object):
         script_builder = """
             import fcntl
             import errno
-            import struct"""
+            import struct
+            import sys
+        """
         if do_flock:
             script_builder += """
             f1 = open("{path}-1", 'r')
@@ -1022,16 +1195,26 @@ class CephFSMount(object):
         path = os.path.join(self.hostfs_mntpt, basename)
 
         pyscript = dedent("""
+            import fcntl
             import os
+            import sys
             import time
+
+            fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
 
             fd = os.open("{path}", os.O_RDWR | os.O_CREAT, 0o644)
             try:
                 while True:
+                    print("write_background: writing", file=sys.stderr)
                     os.write(fd, b'content')
-                    time.sleep(1)
                     if not {loop}:
                         break
+                    try:
+                        if os.read(0, 4096) == b"":
+                            break
+                    except BlockingIOError:
+                        pass
+                    time.sleep(2)
             except IOError as e:
                 pass
             os.close(fd)
@@ -1067,7 +1250,7 @@ class CephFSMount(object):
             size=size
         )))
 
-    def validate_test_pattern(self, filename, size):
+    def validate_test_pattern(self, filename, size, timeout=None):
         log.info("Validating {0} bytes from {1}".format(size, filename))
         # Use sudo because cephfs-data-scan may recreate the file with owner==root
         return self.run_python(dedent("""
@@ -1086,7 +1269,7 @@ class CephFSMount(object):
         """.format(
             path=os.path.join(self.hostfs_mntpt, filename),
             size=size
-        )), sudo=True)
+        )), sudo=True, timeout=timeout)
 
     def open_n_background(self, fs_path, count):
         """
@@ -1100,9 +1283,12 @@ class CephFSMount(object):
         abs_path = os.path.join(self.hostfs_mntpt, fs_path)
 
         pyscript = dedent("""
+            import fcntl
             import sys
             import time
             import os
+
+            fcntl.fcntl(sys.stdin, fcntl.F_SETFL, fcntl.fcntl(sys.stdin, fcntl.F_GETFL) | os.O_NONBLOCK)
 
             n = {count}
             abs_path = "{abs_path}"
@@ -1116,15 +1302,24 @@ class CephFSMount(object):
                 path = os.path.join(abs_path, fname)
                 handles.append(open(path, 'w'))
 
+            print("waiting with handles open", file=sys.stderr)
             while True:
-                time.sleep(1)
+                print("open_n_background: keeping files open", file=sys.stderr)
+                try:
+                     if os.read(0, 4096) == b"":
+                          break
+                except BlockingIOError:
+                    pass
+                time.sleep(2)
+            print("stdin closed, goodbye!", file=sys.stderr)
             """).format(abs_path=abs_path, count=count)
 
         rproc = self._run_python(pyscript)
         self.background_procs.append(rproc)
         return rproc
 
-    def create_n_files(self, fs_path, count, sync=False, dirsync=False, unlink=False, finaldirsync=False):
+    def create_n_files(self, fs_path, count, sync=False, dirsync=False,
+                       unlink=False, finaldirsync=False, hard_links=0):
         """
         Create n files.
 
@@ -1132,6 +1327,7 @@ class CephFSMount(object):
         :param dirsync: sync the containing directory after closing the file
         :param unlink: unlink the file after closing
         :param finaldirsync: sync the containing directory after closing the last file
+        :param hard_links: create given number of hard link(s) for each file
         """
 
         assert(self.is_mounted())
@@ -1140,8 +1336,12 @@ class CephFSMount(object):
 
         pyscript = dedent(f"""
             import os
+            import uuid
 
             n = {count}
+            create_hard_links = False
+            if {hard_links} > 0:
+                create_hard_links = True
             path = "{abs_path}"
 
             dpath = os.path.dirname(path)
@@ -1162,6 +1362,9 @@ class CephFSMount(object):
                         os.unlink(fpath)
                     if {dirsync}:
                         os.fsync(dirfd)
+                    if create_hard_links:
+                        for j in range({hard_links}):
+                            os.system(f"ln {{fpath}} {{dpath}}/{{fnameprefix}}_{{i}}_{{uuid.uuid4()}}")     
                 if {finaldirsync}:
                     os.fsync(dirfd)
             finally:
@@ -1171,11 +1374,11 @@ class CephFSMount(object):
         self.run_python(pyscript)
 
     def teardown(self):
-        for p in self.background_procs:
-            log.info("Terminating background process")
-            self._kill_background(p)
+        log.info("Terminating background process")
+        self.kill_background()
 
-        self.background_procs = []
+        if self.is_mounted():
+            self.umount()
 
     def _kill_background(self, p):
         if p.stdin:
@@ -1185,13 +1388,16 @@ class CephFSMount(object):
             except (CommandFailedError, ConnectionLostError):
                 pass
 
-    def kill_background(self, p):
+    def kill_background(self, p=None):
         """
         For a process that was returned by one of the _background member functions,
         kill it hard.
         """
-        self._kill_background(p)
-        self.background_procs.remove(p)
+        procs = [p] if p is not None else list(self.background_procs)
+        for p in procs:
+            log.debug(f"terminating {p}")
+            self._kill_background(p)
+            self.background_procs.remove(p)
 
     def send_signal(self, signal):
         signal = signal.lower()
@@ -1358,6 +1564,20 @@ class CephFSMount(object):
             # gives you [''] instead of []
             return []
 
+    def removexattr(self, path, key, **kwargs):
+        """
+        Wrap setfattr removal.
+
+        :param path: relative to mount point
+        :param key: xattr name
+        :return: None
+        """
+        kwargs['args'] = ["setfattr", "-x", key, path]
+        if kwargs.pop('sudo', False):
+            kwargs['args'].insert(0, 'sudo')
+            kwargs['omit_sudo'] = False
+        self.run_shell(**kwargs)
+
     def setfattr(self, path, key, val, **kwargs):
         """
         Wrap setfattr.
@@ -1367,11 +1587,11 @@ class CephFSMount(object):
         :param val: xattr value
         :return: None
         """
-        kwargs['args'] = ["setfattr", "-n", key, "-v", val, path]
+        kwargs['args'] = ["setfattr", "-n", str(key), "-v", str(val), path]
         if kwargs.pop('sudo', False):
             kwargs['args'].insert(0, 'sudo')
             kwargs['omit_sudo'] = False
-        self.run_shell(**kwargs)
+        return self.run_shell(**kwargs)
 
     def getfattr(self, path, attr, **kwargs):
         """
@@ -1438,6 +1658,5 @@ class CephFSMount(object):
             subvol_paths = self.ctx.created_subvols[self.cephfs_name]
             path_to_mount = subvol_paths[mount_subvol_num]
             self.cephfs_mntpt = path_to_mount
-        elif not self.cephfs_mntpt:
-            # default to the "/" path
-            self.cephfs_mntpt = "/"
+
+CephFSMount = CephFSMountBase

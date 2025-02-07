@@ -26,6 +26,7 @@ function run() {
     CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
     CEPH_ARGS+="--osd_max_backfills=10 "
+    CEPH_ARGS+="--osd_mclock_override_recovery_settings=true "
     export objects=600
     export poolprefix=test
 
@@ -75,6 +76,10 @@ function wait_for_state() {
 function wait_for_recovery_toofull() {
     local timeout=$1
     wait_for_state recovery_toofull $timeout
+    if [ $ret -ne 0 ]; then
+      echo "Error: Recovery toofull timeout"
+      return 1
+    fi
 }
 
 
@@ -130,7 +135,11 @@ function TEST_recovery_test_simple() {
     done
 
     # If this times out, we'll detected errors below
-    wait_for_recovery_toofull 30
+    wait_for_recovery_toofull 120
+    if [ $? -ne 0 ]; then
+      echo "Error: Recovery toofull timeout"
+      return 1
+    fi
 
     ERRORS=0
     if [ "$(ceph pg dump pgs | grep +recovery_toofull | wc -l)" != "1" ];

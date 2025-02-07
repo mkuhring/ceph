@@ -11,14 +11,22 @@
 #include "crimson/osd/pg_recovery_listener.h"
 #include "crimson/osd/scheduler/scheduler.h"
 #include "crimson/osd/shard_services.h"
+#include "crimson/osd/recovery_backend.h"
 
 #include "osd/object_state.h"
+
+namespace crimson::osd {
+class UrgentRecovery;
+class PglogBasedRecovery;
+}
 
 class MOSDPGBackfillRemove;
 class PGBackend;
 
 class PGRecovery : public crimson::osd::BackfillState::BackfillListener {
 public:
+  using interruptor =
+    crimson::interruptible::interruptor<crimson::osd::IOInterruptCondition>;
   template <typename T = void>
   using interruptible_future = RecoveryBackend::interruptible_future<T>;
   PGRecovery(PGRecoveryListener* pg) : pg(pg) {}
@@ -27,12 +35,22 @@ public:
 
   interruptible_future<bool> start_recovery_ops(
     RecoveryBackend::RecoveryBlockingEvent::TriggerI&,
+    crimson::osd::PglogBasedRecovery &recover_op,
     size_t max_to_start);
+  void on_activate_complete();
   void on_backfill_reserved();
   void dispatch_backfill_event(
     boost::intrusive_ptr<const boost::statechart::event_base> evt);
+  void backfill_target_finished() {
+    backfill_state->backfill_target_done();
+  }
 
   seastar::future<> stop() { return seastar::now(); }
+  void on_pg_clean();
+  void enqueue_push(
+    const hobject_t& obj,
+    const eversion_t& v,
+    const std::vector<pg_shard_t> &peers) final;
 private:
   PGRecoveryListener* pg;
   size_t start_primary_recovery_ops(
@@ -59,7 +77,7 @@ private:
     const hobject_t& soid,
     eversion_t need);
 
-  void on_local_recover(
+  RecoveryBackend::interruptible_future<> on_local_recover(
     const hobject_t& soid,
     const ObjectRecoveryInfo& recovery_info,
     bool is_delete,
@@ -89,15 +107,13 @@ private:
   template <class EventT>
   void start_backfill_recovery(
     const EventT& evt);
+  void backfill_suspended();
   void request_replica_scan(
     const pg_shard_t& target,
     const hobject_t& begin,
     const hobject_t& end) final;
   void request_primary_scan(
     const hobject_t& begin) final;
-  void enqueue_push(
-    const hobject_t& obj,
-    const eversion_t& v) final;
   void enqueue_drop(
     const pg_shard_t& target,
     const hobject_t& obj,

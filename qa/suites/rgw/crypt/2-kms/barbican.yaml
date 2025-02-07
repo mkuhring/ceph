@@ -27,8 +27,11 @@ tasks:
 - tox: [ client.0 ]
 - keystone:
     client.0:
-      sha1: 17.0.0.0rc2
-      force-branch: master
+      force-branch: stable/2024.1
+      services:
+        - name: swift
+          type: object-store
+          description: Swift Service
       projects:
         - name: rgwcrypt
           description: Encryption Tenant
@@ -63,14 +66,9 @@ tasks:
         - name: creator
           user: s3-user
           project: s3
-      services:
-        - name: swift
-          type: object-store
-          description: Swift Service
 - barbican:
     client.0:
-      sha1: 5.0.1
-      force-branch: master
+      force-branch: stable/2024.1
       use-keystone-role: client.0
       keystone_authtoken:
         auth_plugin: password

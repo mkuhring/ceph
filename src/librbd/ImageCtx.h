@@ -55,12 +55,13 @@ namespace librbd {
   template <typename> class PluginRegistry;
 
   namespace asio { struct ContextWQ; }
-  namespace crypto { class CryptoInterface; }
+  namespace crypto { template <typename> class EncryptionFormat; }
   namespace exclusive_lock { struct Policy; }
   namespace io {
   class AioCompletion;
   class AsyncOperation;
   template <typename> class CopyupRequest;
+  enum class ImageArea;
   struct ImageDispatcherInterface;
   struct ObjectDispatcherInterface;
   }
@@ -143,9 +144,11 @@ namespace librbd {
                        // lock_tag
                        // lockers
                        // object_map
-                       // parent_md and parent
+                       // parent_md, parent and parent_rados
+                       // encryption_format
 
     ceph::shared_mutex timestamp_lock; // protects (create/access/modify)_timestamp
+                                       // and internal diff_iterate_lock_timestamp
     ceph::mutex async_ops_lock; // protects async_ops and async_requests
     ceph::mutex copyup_list_lock; // protects copyup_waiting_list
 
@@ -160,7 +163,9 @@ namespace librbd {
     std::string header_oid;
     std::string id; // only used for new-format images
     ParentImageInfo parent_md;
-    ImageCtx *parent;
+    ImageCtx *parent = nullptr;
+    librados::Rados *parent_rados = nullptr; // set iff image is being imported
+                                             // from another cluster
     ImageCtx *child = nullptr;
     MigrationInfo migration_info;
     cls::rbd::GroupSpec group_spec;
@@ -171,6 +176,7 @@ namespace librbd {
     utime_t create_timestamp;
     utime_t access_timestamp;
     utime_t modify_timestamp;
+    utime_t diff_iterate_lock_timestamp;
 
     file_layout_t layout;
 
@@ -230,7 +236,7 @@ namespace librbd {
 
     ZTracer::Endpoint trace_endpoint;
 
-    crypto::CryptoInterface* crypto = nullptr;
+    std::unique_ptr<crypto::EncryptionFormat<ImageCtx>> encryption_format;
 
     // unit test mock helpers
     static ImageCtx* create(const std::string &image_name,
@@ -300,7 +306,7 @@ namespace librbd {
 		 std::string in_snap_name,
 		 librados::snap_t id);
     uint64_t get_image_size(librados::snap_t in_snap_id) const;
-    uint64_t get_effective_image_size(librados::snap_t in_snap_id) const;
+    uint64_t get_area_size(io::ImageArea area) const;
     uint64_t get_object_count(librados::snap_t in_snap_id) const;
     bool test_features(uint64_t test_features) const;
     bool test_features(uint64_t test_features,
@@ -321,10 +327,14 @@ namespace librbd {
     std::string get_parent_image_id(librados::snap_t in_snap_id) const;
     uint64_t get_parent_snap_id(librados::snap_t in_snap_id) const;
     int get_parent_overlap(librados::snap_t in_snap_id,
-			   uint64_t *overlap) const;
+                           uint64_t* raw_overlap) const;
+    std::pair<uint64_t, io::ImageArea> reduce_parent_overlap(
+        uint64_t raw_overlap, bool migration_write) const;
+    uint64_t prune_parent_extents(
+        std::vector<std::pair<uint64_t, uint64_t>>& image_extents,
+        io::ImageArea area, uint64_t raw_overlap, bool migration_write) const;
+
     void register_watch(Context *on_finish);
-    uint64_t prune_parent_extents(std::vector<std::pair<uint64_t,uint64_t> >& objectx,
-				  uint64_t overlap);
 
     void cancel_async_requests();
     void cancel_async_requests(Context *on_finish);
@@ -336,6 +346,7 @@ namespace librbd {
     ObjectMap<ImageCtx> *create_object_map(uint64_t snap_id);
     Journal<ImageCtx> *create_journal();
 
+    uint64_t get_data_offset() const;
     void set_image_name(const std::string &name);
 
     void notify_update();

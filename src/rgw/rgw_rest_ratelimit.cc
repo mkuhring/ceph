@@ -36,7 +36,8 @@ void RGWOp_Ratelimit_Info::execute(optional_yield y)
 
   if (ratelimit_scope == "bucket" && !bucket_name.empty() && !global) {
     std::unique_ptr<rgw::sal::Bucket> bucket;
-    int r = store->get_bucket(s, nullptr, tenant_name, bucket_name, &bucket, y);
+    int r = driver->load_bucket(s, rgw_bucket(tenant_name, bucket_name),
+                                &bucket, y);
     if (r != 0) {
       op_ret = r;
       ldpp_dout(this, 0) << "Error on getting bucket info" << dendl;
@@ -66,7 +67,7 @@ void RGWOp_Ratelimit_Info::execute(optional_yield y)
     RGWRateLimitInfo ratelimit_info;
     rgw_user user(uid_str);
     std::unique_ptr<rgw::sal::User> user_sal;
-    user_sal = store->get_user(user);
+    user_sal = driver->get_user(user);
     if (!rgw::sal::User::empty(user_sal)) {
       op_ret = user_sal->load_user(this, y);
       if (op_ret) {
@@ -98,9 +99,9 @@ void RGWOp_Ratelimit_Info::execute(optional_yield y)
     flusher.flush();
   }
   if (global) {
-    std::string realm_id = store->get_zone()->get_realm_id();
+    std::string realm_id = driver->get_zone()->get_realm_id();
     RGWPeriodConfig period_config;
-    op_ret = period_config.read(this, static_cast<rgw::sal::RadosStore*>(store)->svc()->sysobj, realm_id, y);
+    op_ret = period_config.read(this, static_cast<rgw::sal::RadosStore*>(driver)->svc()->sysobj, realm_id, y);
     if (op_ret && op_ret != -ENOENT) {
       ldpp_dout(this, 0) << "Error on period config read" << dendl;
       return;
@@ -220,7 +221,7 @@ void RGWOp_Ratelimit_Set::execute(optional_yield y)
   sval = s->info.args.get("global", &exists);
   if (exists) {
     if (!boost::iequals(sval,"true") && !boost::iequals(sval,"false")) {
-      ldpp_dout(this, 20) << "global is not equal to true or faslse" << dendl;
+      ldpp_dout(this, 20) << "global is not equal to true or false" << dendl;
       op_ret = -EINVAL;
       return;
     }
@@ -235,7 +236,7 @@ void RGWOp_Ratelimit_Set::execute(optional_yield y)
   if (ratelimit_scope == "user" && !uid_str.empty() && !global) {
     rgw_user user(uid_str);
     std::unique_ptr<rgw::sal::User> user_sal;
-    user_sal = store->get_user(user);
+    user_sal = driver->get_user(user);
     if (!rgw::sal::User::empty(user_sal)) {
       op_ret = user_sal->load_user(this, y);
       if (op_ret) {
@@ -273,7 +274,8 @@ void RGWOp_Ratelimit_Set::execute(optional_yield y)
   if (ratelimit_scope == "bucket" && !bucket_name.empty() && !global) {
     ldpp_dout(this, 0) << "getting bucket info" << dendl;
     std::unique_ptr<rgw::sal::Bucket> bucket;
-    op_ret = store->get_bucket(this, nullptr, tenant_name, bucket_name, &bucket, y);
+    op_ret = driver->load_bucket(this, rgw_bucket(tenant_name, bucket_name),
+                                 &bucket, y);
     if (op_ret) {
       ldpp_dout(this, 0) << "Error on getting bucket info" << dendl;
       return;
@@ -301,9 +303,9 @@ void RGWOp_Ratelimit_Set::execute(optional_yield y)
     return;
   }
   if (global) {
-    std::string realm_id = store->get_zone()->get_realm_id();
+    std::string realm_id = driver->get_zone()->get_realm_id();
     RGWPeriodConfig period_config;
-    op_ret = period_config.read(s, static_cast<rgw::sal::RadosStore*>(store)->svc()->sysobj, realm_id, y);
+    op_ret = period_config.read(s, static_cast<rgw::sal::RadosStore*>(driver)->svc()->sysobj, realm_id, y);
     if (op_ret && op_ret != -ENOENT) {
       ldpp_dout(this, 0) << "Error on period config read" << dendl;
       return;
@@ -314,7 +316,7 @@ void RGWOp_Ratelimit_Set::execute(optional_yield y)
                          have_max_read_bytes, max_read_bytes, have_max_write_bytes, max_write_bytes,
                          have_enabled, enabled, ratelimit_configured, ratelimit_info);
       period_config.bucket_ratelimit = ratelimit_info;
-      op_ret = period_config.write(s, static_cast<rgw::sal::RadosStore*>(store)->svc()->sysobj, realm_id, y);
+      op_ret = period_config.write(s, static_cast<rgw::sal::RadosStore*>(driver)->svc()->sysobj, realm_id, y);
       return;
     }
     if (ratelimit_scope == "anon") {
@@ -323,7 +325,7 @@ void RGWOp_Ratelimit_Set::execute(optional_yield y)
                          have_max_read_bytes, max_read_bytes, have_max_write_bytes, max_write_bytes,
                          have_enabled, enabled, ratelimit_configured, ratelimit_info);
       period_config.anon_ratelimit = ratelimit_info;
-      op_ret = period_config.write(s, static_cast<rgw::sal::RadosStore*>(store)->svc()->sysobj, realm_id, y);
+      op_ret = period_config.write(s, static_cast<rgw::sal::RadosStore*>(driver)->svc()->sysobj, realm_id, y);
       return;
     }
     if (ratelimit_scope == "user") {
@@ -332,7 +334,7 @@ void RGWOp_Ratelimit_Set::execute(optional_yield y)
                          have_max_read_bytes, max_read_bytes, have_max_write_bytes, max_write_bytes,
                          have_enabled, enabled, ratelimit_configured, ratelimit_info);
       period_config.user_ratelimit = ratelimit_info;
-      op_ret = period_config.write(s, static_cast<rgw::sal::RadosStore*>(store)->svc()->sysobj, realm_id, y);
+      op_ret = period_config.write(s, static_cast<rgw::sal::RadosStore*>(driver)->svc()->sysobj, realm_id, y);
       return;
     }
   }

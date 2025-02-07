@@ -13,15 +13,25 @@ export class UsageBarComponent implements OnChanges {
   @Input()
   used: any;
   @Input()
-  warningThreshold: number;
+  warningThreshold?: number;
   @Input()
-  errorThreshold: number;
+  errorThreshold?: number;
   @Input()
   isBinary = true;
   @Input()
   decimals = 0;
   @Input()
   calculatePerc = true;
+  @Input()
+  title = $localize`usage`;
+  @Input()
+  customLegend?: string;
+  @Input()
+  customLegendValue?: string;
+  @Input()
+  showFreeToolTip = true;
+  @Input()
+  showMultisiteTooltip = false;
 
   usedPercentage: number;
   freePercentage: number;

@@ -11,11 +11,13 @@ overrides:
     - \(POOL_APP_NOT_ENABLED\)
     - \(PG_AVAILABILITY\)
     - \(PG_DEGRADED\)
+    - CEPHADM_STRAY_DAEMON
     conf:
       client:
         debug ms: 1
       mon:
         mon warn on pool no app: false
+        mon client hunt on resend: false
       osd:
         osd class load list: "*"
         osd class default list: "*"

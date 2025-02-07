@@ -18,10 +18,9 @@
 #include <iostream>
 #include <string_view>
 
-#undef FMT_HEADER_ONLY
-#define FMT_HEADER_ONLY 1
 #include <fmt/format.h>
 
+#include "common/Clock.h" // for ceph_clock_now()
 #include "include/types.h"
 #include "include/rados/librados.hpp"
 
@@ -30,8 +29,8 @@
 
 #include "cls/log/cls_log_client.h"
 
-#include "rgw/rgw_tools.h"
-#include "rgw/cls_fifo_legacy.h"
+#include "rgw_tools.h"
+#include "cls_fifo_legacy.h"
 
 #include "gtest/gtest.h"
 

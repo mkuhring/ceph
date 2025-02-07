@@ -4,6 +4,7 @@
 #include "include/Context.h"
 #include "common/ceph_json.h"
 #include "rgw_coroutine.h"
+#include "rgw_asio_thread.h"
 
 // re-include our assert to clobber the system one; fix dout:
 #include "include/ceph_assert.h"
@@ -557,7 +558,7 @@ bool RGWCoroutinesStack::consume_io_finish(const rgw_io_id& io_id)
 
 
 void RGWCoroutinesManager::handle_unblocked_stack(set<RGWCoroutinesStack *>& context_stacks, list<RGWCoroutinesStack *>& scheduled_stacks,
-                                                  RGWCompletionManager::io_completion& io, int *blocked_count)
+                                                  RGWCompletionManager::io_completion& io, int *blocked_count, int *interval_wait_count)
 {
   ceph_assert(ceph_mutex_is_wlocked(lock));
   RGWCoroutinesStack *stack = static_cast<RGWCoroutinesStack *>(io.user_info);
@@ -570,6 +571,9 @@ void RGWCoroutinesManager::handle_unblocked_stack(set<RGWCoroutinesStack *>& con
   if (stack->is_io_blocked()) {
     --(*blocked_count);
     stack->set_io_blocked(false);
+    if (stack->is_interval_waiting()) {
+      --(*interval_wait_count);
+    }
   }
   stack->set_interval_wait(false);
   if (!stack->is_done()) {
@@ -612,6 +616,8 @@ void RGWCoroutinesManager::io_complete(RGWCoroutine *cr, const rgw_io_id& io_id)
 
 int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesStack *>& stacks)
 {
+  maybe_warn_about_blocking(dpp);
+
   int ret = 0;
   int blocked_count = 0;
   int interval_wait_count = 0;
@@ -707,7 +713,7 @@ int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesS
     }
 
     while (completion_mgr->try_get_next(&io)) {
-      handle_unblocked_stack(context_stacks, scheduled_stacks, io, &blocked_count);
+      handle_unblocked_stack(context_stacks, scheduled_stacks, io, &blocked_count, &interval_wait_count);
     }
 
     /*
@@ -722,7 +728,7 @@ int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesS
       if (ret < 0) {
        ldout(cct, 5) << "completion_mgr.get_next() returned ret=" << ret << dendl;
       }
-      handle_unblocked_stack(context_stacks, scheduled_stacks, io, &blocked_count);
+      handle_unblocked_stack(context_stacks, scheduled_stacks, io, &blocked_count, &interval_wait_count);
     }
 
 next:
@@ -739,7 +745,7 @@ next:
         canceled = true;
         break;
       }
-      handle_unblocked_stack(context_stacks, scheduled_stacks, io, &blocked_count);
+      handle_unblocked_stack(context_stacks, scheduled_stacks, io, &blocked_count, &interval_wait_count);
       iter = scheduled_stacks.begin();
     }
     if (canceled) {
@@ -880,6 +886,7 @@ int RGWCoroutinesManagerRegistry::hook_to_admin_command(const string& command)
 
 int RGWCoroutinesManagerRegistry::call(std::string_view command,
 				       const cmdmap_t& cmdmap,
+				       const bufferlist&,
 				       Formatter *f,
 				       std::ostream& ss,
 				       bufferlist& out) {
@@ -1073,8 +1080,21 @@ int RGWSimpleCoroutine::operate(const DoutPrefixProvider *dpp)
   int ret = 0;
   reenter(this) {
     yield return state_init();
-    yield return state_send_request(dpp);
-    yield return state_request_complete();
+
+    for (tries = 0; tries < max_eio_retries; tries++) {
+      yield return state_send_request(dpp);
+      yield return state_request_complete();
+
+      if (op_ret == -EIO && tries < max_eio_retries - 1) {
+        ldout(cct, 20) << "request IO error. retries=" << tries << dendl;
+        continue;
+      } else if (op_ret < 0) {
+        call_cleanup();
+        return set_state(RGWCoroutine_Error, op_ret);
+      }
+      break;
+    }
+
     yield return state_all_complete();
     drain_all();
     call_cleanup();
@@ -1105,10 +1125,10 @@ int RGWSimpleCoroutine::state_send_request(const DoutPrefixProvider *dpp)
 
 int RGWSimpleCoroutine::state_request_complete()
 {
-  int ret = request_complete();
-  if (ret < 0) {
+  op_ret = request_complete();
+  if (op_ret < 0 && op_ret != -EIO) {
     call_cleanup();
-    return set_state(RGWCoroutine_Error, ret);
+    return set_state(RGWCoroutine_Error, op_ret);
   }
   return 0;
 }

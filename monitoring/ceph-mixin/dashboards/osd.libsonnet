@@ -1,5 +1,6 @@
 local g = import 'grafonnet/grafana.libsonnet';
 
+
 (import 'utils.libsonnet') {
   'osds-overview.json':
     $.dashboardSchema(
@@ -23,6 +24,20 @@ local g = import 'grafonnet/grafana.libsonnet';
         'dashboard'
       )
     )
+    .addLinks([
+      $.addLinkSchema(
+        asDropdown=true,
+        icon='external link',
+        includeVars=true,
+        keepTime=true,
+        tags=[],
+        targetBlank=false,
+        title='Browse Dashboards',
+        tooltip='',
+        type='dashboards',
+        url=''
+      ),
+    ])
     .addRequired(
       type='grafana', id='grafana', name='Grafana', version='5.0.0'
     )
@@ -40,9 +55,6 @@ local g = import 'grafonnet/grafana.libsonnet';
     )
     .addTemplate(
       $.addClusterTemplate()
-    )
-    .addTemplate(
-      $.addJobTemplate()
     )
     .addPanels([
       $.simpleGraphPanel(
@@ -89,19 +101,70 @@ local g = import 'grafonnet/grafana.libsonnet';
           ),
         ],
       ),
-      $.addTableSchema(
-        '$datasource',
-        "This table shows the osd's that are delivering the 10 highest read latencies within the cluster",
-        { col: 2, desc: true },
-        [
-          $.overviewStyle('OSD ID', 'ceph_daemon', 'string', 'short'),
-          $.overviewStyle('Latency (ms)', 'Value', 'number', 'none'),
-          $.overviewStyle('', '/.*/', 'hidden', 'short'),
+
+      $.addTableExtended(
+        datasource='${datasource}',
+        title='Highest READ Latencies',
+        gridPosition={ h: 8, w: 4, x: 8, y: 0 },
+        options={
+          footer: {
+            fields: '',
+            reducer: ['sum'],
+            countRows: false,
+            enablePagination: false,
+            show: false,
+          },
+          frameIndex: 1,
+          showHeader: true,
+        },
+        custom={ align: 'null', cellOptions: { type: 'auto' }, filterable: true, inspect: false },
+        thresholds={
+          mode: 'absolute',
+          steps: [
+            { color: 'green', value: null },
+            { color: 'red', value: 80 },
+          ],
+        },
+        overrides=[
+          {
+            matcher: { id: 'byName', options: 'ceph_daemon' },
+            properties: [
+              { id: 'displayName', value: 'OSD ID' },
+              { id: 'unit', value: 'short' },
+              { id: 'decimals', value: 2 },
+              { id: 'custom.align', value: null },
+            ],
+          },
+          {
+            matcher: { id: 'byName', options: 'Value' },
+            properties: [
+              { id: 'displayName', value: 'Latency (ms)' },
+              { id: 'unit', value: 'none' },
+              { id: 'decimals', value: 2 },
+              { id: 'custom.align', value: null },
+            ],
+          },
         ],
-        'Highest READ Latencies',
-        'table'
+        pluginVersion='10.4.0'
       )
-      .addTarget(
+      .addTransformations([
+        {
+          id: 'merge',
+          options: { reducers: [] },
+        },
+        {
+          id: 'organize',
+          options: {
+            excludeByName: {
+              Time: true,
+              cluster: true,
+            },
+            indexByName: {},
+            renameByName: {},
+            includeByName: {},
+          },
+        },
+      ]).addTarget(
         $.addTargetSchema(
           |||
             topk(10,
@@ -119,7 +182,8 @@ local g = import 'grafonnet/grafana.libsonnet';
           1,
           true
         )
-      ) + { gridPos: { x: 8, y: 0, w: 4, h: 8 } },
+      ),
+
       $.simpleGraphPanel(
         {
           '@95%ile write': '#e0752d',
@@ -164,21 +228,80 @@ local g = import 'grafonnet/grafana.libsonnet';
           ),
         ],
       ),
-      $.addTableSchema(
-        '$datasource',
-        "This table shows the osd's that are delivering the 10 highest write latencies within the cluster",
-        { col: 2, desc: true },
-        [
-          $.overviewStyle(
-            'OSD ID', 'ceph_daemon', 'string', 'short'
-          ),
-          $.overviewStyle('Latency (ms)', 'Value', 'number', 'none'),
-          $.overviewStyle('', '/.*/', 'hidden', 'short'),
+
+      $.addTableExtended(
+        datasource='${datasource}',
+        title='Highest WRITE Latencies',
+        description="This table shows the osd's that are delivering the 10 highest write latencies within the cluster",
+        gridPosition={ h: 8, w: 4, x: 20, y: 0 },
+        options={
+          footer: {
+            fields: '',
+            reducer: ['sum'],
+            countRows: false,
+            enablePagination: false,
+            show: false,
+          },
+          frameIndex: 1,
+          showHeader: true,
+        },
+        custom={ align: 'null', cellOptions: { type: 'auto' }, filterable: true, inspect: false },
+        thresholds={
+          mode: 'absolute',
+          steps: [
+            { color: 'green', value: null },
+            { color: 'red', value: 80 },
+          ],
+        },
+        overrides=[
+          {
+            matcher: { id: 'byName', options: 'ceph_daemon' },
+            properties: [
+              { id: 'displayName', value: 'OSD ID' },
+              { id: 'unit', value: 'short' },
+              { id: 'decimals', value: 2 },
+              { id: 'custom.align', value: null },
+            ],
+          },
+          {
+            matcher: { id: 'byName', options: 'Value' },
+            properties: [
+              { id: 'displayName', value: 'Latency (ms)' },
+              { id: 'unit', value: 'none' },
+              { id: 'decimals', value: 2 },
+              { id: 'custom.align', value: null },
+            ],
+          },
+          {
+            matcher: { id: 'byName', options: 'Value' },
+            properties: [
+              { id: 'mappings', value: [{ type: 'value', options: { NaN: { text: '0.00', index: 0 } } }] },
+              { id: 'unit', value: 'none' },
+              { id: 'decimals', value: 2 },
+              { id: 'custom.align', value: null },
+            ],
+          },
         ],
-        'Highest WRITE Latencies',
-        'table'
+        pluginVersion='10.4.0'
       )
-      .addTarget(
+      .addTransformations([
+        {
+          id: 'merge',
+          options: { reducers: [] },
+        },
+        {
+          id: 'organize',
+          options: {
+            excludeByName: {
+              Time: true,
+              cluster: true,
+            },
+            indexByName: {},
+            renameByName: {},
+            includeByName: {},
+          },
+        },
+      ]).addTarget(
         $.addTargetSchema(
           |||
             topk(10,
@@ -194,29 +317,20 @@ local g = import 'grafonnet/grafana.libsonnet';
           1,
           true
         )
-      ) + { gridPos: { x: 20, y: 0, w: 4, h: 8 } },
-      $.simplePieChart(
-        {}, '', 'OSD Types Summary'
-      )
+      ),
+
+      $.pieChartPanel('OSD Types Summary', '', '$datasource', { x: 0, y: 8, w: 4, h: 8 }, 'table', 'bottom', true, ['percent'], { mode: 'single', sort: 'none' }, 'pie', ['percent', 'value'], 'palette-classic')
       .addTarget(
         $.addTargetSchema('count by (device_class) (ceph_osd_metadata{%(matchers)s})' % $.matchers(), '{{device_class}}')
-      ) + { gridPos: { x: 0, y: 8, w: 4, h: 8 } },
-      $.simplePieChart(
-        { 'Non-Encrypted': '#E5AC0E' }, '', 'OSD Objectstore Types'
-      )
-      .addTarget(
-        $.addTargetSchema(
-          'count(ceph_bluefs_wal_total_bytes{%(matchers)s})' % $.matchers(), 'bluestore', 'time_series', 2
-        )
-      )
-      .addTarget(
-        $.addTargetSchema(
-          'absent(ceph_bluefs_wal_total_bytes{%(matchers)s}) * count(ceph_osd_metadata{%(matchers)s})' % $.matchers(), 'filestore', 'time_series', 2
-        )
-      ) + { gridPos: { x: 4, y: 8, w: 4, h: 8 } },
-      $.simplePieChart(
-        {}, 'The pie chart shows the various OSD sizes used within the cluster', 'OSD Size Summary'
-      )
+      ),
+      $.pieChartPanel('OSD Objectstore Types', '', '$datasource', { x: 4, y: 8, w: 4, h: 8 }, 'table', 'bottom', true, ['percent'], { mode: 'single', sort: 'none' }, 'pie', ['percent', 'value'], 'palette-classic')
+      .addTarget($.addTargetSchema(
+        'count(ceph_bluefs_wal_total_bytes{%(matchers)s})' % $.matchers(), 'bluestore', 'time_series', 2
+      ))
+      .addTarget($.addTargetSchema(
+        'absent(ceph_bluefs_wal_total_bytes{%(matchers)s}) * count(ceph_osd_metadata{%(matchers)s})' % $.matchers(), 'filestore', 'time_series', 2
+      )),
+      $.pieChartPanel('OSD Size Summary', 'The pie chart shows the various OSD sizes used within the cluster', '$datasource', { x: 8, y: 8, w: 4, h: 8 }, 'table', 'bottom', true, ['percent'], { mode: 'single', sort: 'none' }, 'pie', ['percent', 'value'], 'palette-classic')
       .addTarget($.addTargetSchema(
         'count(ceph_osd_stat_bytes{%(matchers)s} < 1099511627776)' % $.matchers(), '<1TB', 'time_series', 2
       ))
@@ -243,7 +357,7 @@ local g = import 'grafonnet/grafana.libsonnet';
       ))
       .addTarget($.addTargetSchema(
         'count(ceph_osd_stat_bytes{%(matchers)s} >= 13194139533312)' % $.matchers(), '<12TB+', 'time_series', 2
-      )) + { gridPos: { x: 8, y: 8, w: 4, h: 8 } },
+      )),
       g.graphPanel.new(bars=true,
                        datasource='$datasource',
                        title='Distribution of PGs per OSD',
@@ -257,7 +371,7 @@ local g = import 'grafonnet/grafana.libsonnet';
                        nullPointMode='null')
       .addTarget($.addTargetSchema(
         'ceph_osd_numpg{%(matchers)s}' % $.matchers(), 'PGs per OSD', 'time_series', 1, true
-      )) + { gridPos: { x: 12, y: 8, w: 8, h: 8 } },
+      )) + { type: 'timeseries' } + { fieldConfig: { defaults: { unit: 'short', custom: { fillOpacity: 8, showPoints: 'never' } } } } + { gridPos: { x: 12, y: 8, w: 8, h: 8 } },
       $.gaugeSingleStatPanel(
         'percentunit',
         'OSD onode Hits Ratio',
@@ -300,6 +414,87 @@ local g = import 'grafonnet/grafana.libsonnet';
       .addTargets([$.addTargetSchema(
         'round(sum(rate(ceph_pool_wr{%(matchers)s}[$__rate_interval])))' % $.matchers(), 'Writes'
       )]),
+
+      $.addTableExtended(
+        datasource='${datasource}',
+        title='Top Slow Ops',
+        description='This table shows the 10 OSDs with the highest number of slow ops',
+        gridPosition={ h: 8, w: 5, x: 0, y: 25 },
+        options={
+          footer: {
+            fields: '',
+            reducer: ['sum'],
+            countRows: false,
+            enablePagination: false,
+            show: false,
+          },
+          frameIndex: 1,
+          showHeader: true,
+        },
+        custom={ align: 'null', cellOptions: { type: 'auto' }, filterable: true, inspect: false },
+        thresholds={
+          mode: 'absolute',
+          steps: [
+            { color: 'green', value: null },
+            { color: 'red', value: 80 },
+          ],
+        },
+        overrides=[
+          {
+            matcher: { id: 'byName', options: 'ceph_daemon' },
+            properties: [
+              { id: 'displayName', value: 'OSD ID' },
+              { id: 'unit', value: 'short' },
+              { id: 'decimals', value: 2 },
+              { id: 'custom.align', value: null },
+            ],
+          },
+          {
+            matcher: { id: 'byName', options: 'Value' },
+            properties: [
+              { id: 'displayName', value: 'Slow Ops' },
+              { id: 'unit', value: 'none' },
+              { id: 'decimals', value: 2 },
+              { id: 'custom.align', value: null },
+            ],
+          },
+        ],
+        pluginVersion='10.4.0'
+      )
+      .addTransformations([
+        {
+          id: 'merge',
+          options: { reducers: [] },
+        },
+        {
+          id: 'organize',
+          options: {
+            excludeByName: {
+              Time: true,
+              __name__: true,
+              instance: true,
+              job: true,
+              type: true,
+              cluster: true,
+            },
+            indexByName: {},
+            renameByName: {},
+            includeByName: {},
+          },
+        },
+      ]).addTarget(
+        $.addTargetSchema(
+          |||
+            topk(10,
+              (ceph_daemon_health_metrics{type="SLOW_OPS", ceph_daemon=~"osd.*"})
+            )
+          ||| % $.matchers(),
+          '',
+          'table',
+          1,
+          true
+        )
+      ),
     ]),
   'osd-device-details.json':
     local OsdDeviceDetailsPanel(title,
@@ -317,7 +512,7 @@ local g = import 'grafonnet/grafana.libsonnet';
       $.graphPanelSchema({},
                          title,
                          description,
-                         'null',
+                         'null as zero',
                          false,
                          formatY1,
                          'short',
@@ -332,7 +527,7 @@ local g = import 'grafonnet/grafana.libsonnet';
                             legendFormat1),
           $.addTargetSchema(expr2, legendFormat2),
         ]
-      ) + { gridPos: { x: x, y: y, w: w, h: h } };
+      ) + { type: 'timeseries' } + { fieldConfig: { defaults: { unit: formatY1, custom: { fillOpacity: 8, showPoints: 'never' } } } } + { gridPos: { x: x, y: y, w: w, h: h } };
 
     $.dashboardSchema(
       'OSD device details',
@@ -355,6 +550,20 @@ local g = import 'grafonnet/grafana.libsonnet';
         'dashboard'
       )
     )
+    .addLinks([
+      $.addLinkSchema(
+        asDropdown=true,
+        icon='external link',
+        includeVars=true,
+        keepTime=true,
+        tags=[],
+        targetBlank=false,
+        title='Browse Dashboards',
+        tooltip='',
+        type='dashboards',
+        url=''
+      ),
+    ])
     .addRequired(
       type='grafana', id='grafana', name='Grafana', version='5.3.2'
     )
@@ -369,9 +578,6 @@ local g = import 'grafonnet/grafana.libsonnet';
     )
     .addTemplate(
       $.addClusterTemplate()
-    )
-    .addTemplate(
-      $.addJobTemplate()
     )
     .addTemplate(
       $.addTemplateSchema('osd',
@@ -393,11 +599,11 @@ local g = import 'grafonnet/grafana.libsonnet';
         's',
         'Read (-) / Write (+)',
         |||
-          rate(ceph_osd_op_r_latency_sum{%(matchers)s, ceph_daemon=~"$osd"}[$__rate_interval]) /
+          rate(ceph_osd_op_r_latency_sum{ceph_daemon=~"$osd", %(matchers)s}[$__rate_interval]) /
             on (ceph_daemon) rate(ceph_osd_op_r_latency_count{%(matchers)s}[$__rate_interval])
         ||| % $.matchers(),
         |||
-          rate(ceph_osd_op_w_latency_sum{%(matchers)s, ceph_daemon=~"$osd"}[$__rate_interval]) /
+          rate(ceph_osd_op_w_latency_sum{ceph_daemon=~"$osd", %(matchers)s}[$__rate_interval]) /
             on (ceph_daemon) rate(ceph_osd_op_w_latency_count{%(matchers)s}[$__rate_interval])
         ||| % $.matchers(),
         'read',
@@ -418,8 +624,8 @@ local g = import 'grafonnet/grafana.libsonnet';
         '',
         'short',
         'Read (-) / Write (+)',
-        'rate(ceph_osd_op_r{%(matchers)s, ceph_daemon=~"$osd"}[$__rate_interval])' % $.matchers(),
-        'rate(ceph_osd_op_w{%(matchers)s, ceph_daemon=~"$osd"}[$__rate_interval])' % $.matchers(),
+        'rate(ceph_osd_op_r{ceph_daemon=~"$osd", %(matchers)s}[$__rate_interval])' % $.matchers(),
+        'rate(ceph_osd_op_w{ceph_daemon=~"$osd", %(matchers)s}[$__rate_interval])' % $.matchers(),
         'Reads',
         'Writes',
         6,
@@ -435,8 +641,8 @@ local g = import 'grafonnet/grafana.libsonnet';
         '',
         'bytes',
         'Read (-) / Write (+)',
-        'rate(ceph_osd_op_r_out_bytes{%(matchers)s, ceph_daemon=~"$osd"}[$__rate_interval])' % $.matchers(),
-        'rate(ceph_osd_op_w_in_bytes{%(matchers)s, ceph_daemon=~"$osd"}[$__rate_interval])' % $.matchers(),
+        'rate(ceph_osd_op_r_out_bytes{ceph_daemon=~"$osd", %(matchers)s}[$__rate_interval])' % $.matchers(),
+        'rate(ceph_osd_op_w_in_bytes{ceph_daemon=~"$osd", %(matchers)s}[$__rate_interval])' % $.matchers(),
         'Read Bytes',
         'Write Bytes',
         12,
@@ -456,12 +662,12 @@ local g = import 'grafonnet/grafana.libsonnet';
         |||
           (
             label_replace(
-              rate(node_disk_read_time_seconds_total{%(clusterMatcher)s}[$__rate_interval]) /
-                rate(node_disk_reads_completed_total{%(clusterMatcher)s}[$__rate_interval]),
+              rate(node_disk_read_time_seconds_total[$__rate_interval]) /
+                rate(node_disk_reads_completed_total[$__rate_interval]),
               "instance", "$1", "instance", "([^:.]*).*"
             ) and on (instance, device) label_replace(
               label_replace(
-                ceph_disk_occupation_human{%(matchers)s, ceph_daemon=~"$osd"},
+                ceph_disk_occupation_human{ceph_daemon=~"$osd", %(matchers)s},
                 "device", "$1", "device", "/dev/(.*)"
               ), "instance", "$1", "instance", "([^:.]*).*"
             )
@@ -470,12 +676,12 @@ local g = import 'grafonnet/grafana.libsonnet';
         |||
           (
             label_replace(
-              rate(node_disk_write_time_seconds_total{%(clusterMatcher)s}[$__rate_interval]) /
-                rate(node_disk_writes_completed_total{%(clusterMatcher)s}[$__rate_interval]),
+              rate(node_disk_write_time_seconds_total[$__rate_interval]) /
+                rate(node_disk_writes_completed_total[$__rate_interval]),
               "instance", "$1", "instance", "([^:.]*).*") and on (instance, device)
               label_replace(
                 label_replace(
-                  ceph_disk_occupation_human{%(matchers)s, ceph_daemon=~"$osd"}, "device", "$1", "device", "/dev/(.*)"
+                  ceph_disk_occupation_human{ceph_daemon=~"$osd", %(matchers)s}, "device", "$1", "device", "/dev/(.*)"
                 ), "instance", "$1", "instance", "([^:.]*).*"
               )
             )
@@ -497,22 +703,22 @@ local g = import 'grafonnet/grafana.libsonnet';
         'Read (-) / Write (+)',
         |||
           label_replace(
-            rate(node_disk_writes_completed_total{%(clusterMatcher)s}[$__rate_interval]),
+            rate(node_disk_writes_completed_total[$__rate_interval]),
             "instance", "$1", "instance", "([^:.]*).*"
           ) and on (instance, device) label_replace(
             label_replace(
-              ceph_disk_occupation_human{%(matchers)s, ceph_daemon=~"$osd"},
+              ceph_disk_occupation_human{ceph_daemon=~"$osd", %(matchers)s},
               "device", "$1", "device", "/dev/(.*)"
             ), "instance", "$1", "instance", "([^:.]*).*"
           )
         ||| % $.matchers(),
         |||
           label_replace(
-            rate(node_disk_reads_completed_total{%(clusterMatcher)s}[$__rate_interval]),
+            rate(node_disk_reads_completed_total[$__rate_interval]),
             "instance", "$1", "instance", "([^:.]*).*"
           ) and on (instance, device) label_replace(
             label_replace(
-              ceph_disk_occupation_human{%(matchers)s, ceph_daemon=~"$osd"},
+              ceph_disk_occupation_human{ceph_daemon=~"$osd", %(matchers)s},
               "device", "$1", "device", "/dev/(.*)"
             ), "instance", "$1", "instance", "([^:.]*).*"
           )
@@ -534,20 +740,20 @@ local g = import 'grafonnet/grafana.libsonnet';
         'Read (-) / Write (+)',
         |||
           label_replace(
-            rate(node_disk_read_bytes_total{%(clusterMatcher)s}[$__rate_interval]), "instance", "$1", "instance", "([^:.]*).*"
+            rate(node_disk_read_bytes_total[$__rate_interval]), "instance", "$1", "instance", "([^:.]*).*"
           ) and on (instance, device) label_replace(
             label_replace(
-              ceph_disk_occupation_human{%(matchers)s, ceph_daemon=~"$osd"},
+              ceph_disk_occupation_human{ceph_daemon=~"$osd", %(matchers)s},
               "device", "$1", "device", "/dev/(.*)"
             ), "instance", "$1", "instance", "([^:.]*).*"
           )
         ||| % $.matchers(),
         |||
           label_replace(
-            rate(node_disk_written_bytes_total{%(clusterMatcher)s}[$__rate_interval]), "instance", "$1", "instance", "([^:.]*).*"
+            rate(node_disk_written_bytes_total[$__rate_interval]), "instance", "$1", "instance", "([^:.]*).*"
           ) and on (instance, device) label_replace(
             label_replace(
-              ceph_disk_occupation_human{%(matchers)s, ceph_daemon=~"$osd"},
+              ceph_disk_occupation_human{ceph_daemon=~"$osd", %(matchers)s},
               "device", "$1", "device", "/dev/(.*)"
             ), "instance", "$1", "instance", "([^:.]*).*"
           )
@@ -579,15 +785,15 @@ local g = import 'grafonnet/grafana.libsonnet';
       .addTarget($.addTargetSchema(
         |||
           label_replace(
-            rate(node_disk_io_time_seconds_total{%(clusterMatcher)s}[$__rate_interval]),
+            rate(node_disk_io_time_seconds_total[$__rate_interval]),
             "instance", "$1", "instance", "([^:.]*).*"
           ) and on (instance, device) label_replace(
             label_replace(
-              ceph_disk_occupation_human{%(matchers)s, ceph_daemon=~"$osd"}, "device", "$1", "device", "/dev/(.*)"
+              ceph_disk_occupation_human{ceph_daemon=~"$osd", %(matchers)s}, "device", "$1", "device", "/dev/(.*)"
             ), "instance", "$1", "instance", "([^:.]*).*"
           )
         ||| % $.matchers(),
         '{{device}} on {{instance}}'
-      )) + { gridPos: { x: 18, y: 11, w: 6, h: 9 } },
+      )) + { type: 'timeseries' } + { fieldConfig: { defaults: { unit: 'percentunit', custom: { fillOpacity: 8, showPoints: 'never' } } } } + { gridPos: { x: 18, y: 11, w: 6, h: 9 } },
     ]),
 }

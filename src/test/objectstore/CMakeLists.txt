@@ -6,7 +6,8 @@ install(TARGETS ceph_perf_objectstore
 
 add_library(store_test_fixture OBJECT store_test_fixture.cc)
 target_include_directories(store_test_fixture PRIVATE
-  $<TARGET_PROPERTY:GTest::GTest,INTERFACE_INCLUDE_DIRECTORIES>)
+  $<TARGET_PROPERTY:GTest::GTest,INTERFACE_INCLUDE_DIRECTORIES>
+  legacy-option-headers)
 
 add_executable(ceph_test_objectstore
   store_test.cc
@@ -23,6 +24,8 @@ target_link_libraries(ceph_test_objectstore
 install(TARGETS ceph_test_objectstore
   DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+add_subdirectory(allocsim)
+
 add_executable(ceph_test_keyvaluedb
   test_kv.cc)
 target_link_libraries(ceph_test_keyvaluedb
@@ -37,44 +40,6 @@ target_link_libraries(ceph_test_keyvaluedb
 install(TARGETS ceph_test_keyvaluedb
   DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# ceph_test_filestore_idempotent
-add_executable(ceph_test_filestore_idempotent
-  test_idempotent.cc
-  FileStoreTracker.cc
-  ${CMAKE_SOURCE_DIR}/src/test/common/ObjectContents.cc
-  )
-target_link_libraries(ceph_test_filestore_idempotent
-  os
-  global
-  ${EXTRALIBS}
-  ${BLKID_LIBRARIES}
-  ${CMAKE_DL_LIBS}
-  )
-
-# ceph_test_filestore_idempotent_sequence
-add_executable(ceph_test_filestore_idempotent_sequence
-  test_idempotent_sequence.cc
-  DeterministicOpSequence.cc
-  TestObjectStoreState.cc
-  FileStoreDiff.cc
-  )
-target_link_libraries(ceph_test_filestore_idempotent_sequence
-  os
-  global
-  ${EXTRALIBS}
-  ${BLKID_LIBRARIES}
-  ${CMAKE_DL_LIBS}
-  )
-install(TARGETS ceph_test_filestore_idempotent_sequence
-  DESTINATION ${CMAKE_INSTALL_BINDIR})
-
-# unittest_chain_xattr
-add_executable(unittest_chain_xattr
-  chain_xattr.cc
-  )
-add_ceph_unittest(unittest_chain_xattr)
-target_link_libraries(unittest_chain_xattr os global)
-
 # unittest_rocksdb_option
 add_executable(unittest_rocksdb_option
   TestRocksdbOptionParse.cc
@@ -82,6 +47,18 @@ add_executable(unittest_rocksdb_option
   )
 add_ceph_unittest(unittest_rocksdb_option)
 target_link_libraries(unittest_rocksdb_option global os ${BLKID_LIBRARIES})
+
+# ceph_test_bluefs (a clone of unittest_bluefs)
+add_executable(ceph_test_bluefs
+  test_bluefs.cc
+  )
+target_link_libraries(ceph_test_bluefs
+  os
+  global
+  ${UNITTEST_LIBS}
+  )
+install(TARGETS ceph_test_bluefs
+  DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(WITH_EVENTTRACE)
   add_dependencies(os eventtrace_tp)
@@ -176,3 +153,13 @@ if(WITH_BLUESTORE)
   install(TARGETS ceph_test_alloc_replay
     DESTINATION bin)
 endif()
+
+# fragmentation simulator
+add_executable(ceph_test_fragmentation_sim
+  Fragmentation_simulator.cc
+  ObjectStoreImitator.cc)
+add_ceph_unittest(ceph_test_fragmentation_sim)
+target_link_libraries(ceph_test_fragmentation_sim os global)
+
+set_target_properties(ceph_test_fragmentation_sim PROPERTIES COMPILE_FLAGS
+"${UNITTEST_CXX_FLAGS}")

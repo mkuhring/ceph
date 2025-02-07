@@ -7,6 +7,7 @@
 #include <array>
 #include <set>
 #include <vector>
+#include <boost/core/demangle.hpp>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive_ptr.hpp>
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
@@ -19,7 +20,9 @@
 #include "include/ceph_assert.h"
 #include "include/utime.h"
 #include "common/Clock.h"
+#include "common/Formatter.h"
 #include "crimson/common/interruptible_future.h"
+#include "crimson/common/smp_helpers.h"
 #include "crimson/common/log.h"
 
 namespace ceph {
@@ -119,7 +122,10 @@ struct TimeEvent : Event<T> {
   } internal_backend;
 
   void dump(ceph::Formatter *f) const {
-    detail::dump_time_event(typeid(T).name(), internal_backend.timestamp, f);
+    auto demangled_name = boost::core::demangle(typeid(T).name());
+    detail::dump_time_event(
+      demangled_name.c_str(),
+      internal_backend.timestamp, f);
   }
 
   auto get_timestamp() const {
@@ -131,17 +137,21 @@ struct TimeEvent : Event<T> {
 template <typename T>
 class BlockerT : public Blocker {
 public:
-  struct BlockingEvent : Event<typename T::BlockingEvent> {
+  struct BlockingEvent : Event<BlockingEvent>,
+                         boost::intrusive::list_base_hook<> {
     using Blocker = std::decay_t<T>;
+
+    struct ExitBarrierEvent : TimeEvent<ExitBarrierEvent> {
+    } exit_barrier_event;
 
     struct Backend {
       // `T` is based solely to let implementations to discriminate
       // basing on the type-of-event.
-      virtual void handle(typename T::BlockingEvent&, const Operation&, const T&) = 0;
+      virtual void handle(BlockingEvent&, const Operation&, const T&) = 0;
     };
 
     struct InternalBackend : Backend {
-      void handle(typename T::BlockingEvent&,
+      void handle(BlockingEvent&,
                   const Operation&,
                   const T& blocker) override {
         this->timestamp = ceph_clock_now();
@@ -159,7 +169,7 @@ public:
       TriggerI(BlockingEvent& event) : event(event) {}
 
       template <class FutureT>
-      auto maybe_record_blocking(FutureT&& fut, const T& blocker) {
+      auto maybe_record_blocking(FutureT&& fut, T& blocker) {
         if (!fut.available()) {
 	  // a full blown call via vtable. that's the cost for templatization
 	  // avoidance. anyway, most of the things actually have the type
@@ -177,10 +187,13 @@ public:
       virtual ~TriggerI() = default;
     protected:
       // it's for the sake of erasing the OpT type
-      virtual void record_blocking(const T& blocker) = 0;
+      virtual void record_blocking(T& blocker) = 0;
 
-      static void record_unblocking(BlockingEvent& event, const T& blocker) {
-	assert(event.internal_backend.blocker == &blocker);
+      static void record_unblocking(BlockingEvent& event, T& blocker) {
+        if (event.internal_backend.blocker) {
+          assert(event.internal_backend.blocker == &blocker);
+          blocker.delete_event(event);
+        }
 	event.internal_backend.blocker = nullptr;
       }
 
@@ -192,7 +205,7 @@ public:
       Trigger(BlockingEvent& event, const OpT& op) : TriggerI(event), op(op) {}
 
       template <class FutureT>
-      auto maybe_record_blocking(FutureT&& fut, const T& blocker) {
+      auto maybe_record_blocking(FutureT&& fut, T& blocker) {
         if (!fut.available()) {
 	  // no need for the dynamic dispatch! if we're lucky, a compiler
 	  // should collapse all these abstractions into a bunch of movs.
@@ -205,32 +218,60 @@ public:
 	return std::forward<FutureT>(fut);
       }
 
+      const OpT &get_op() { return op; }
+
+      template <class FutureT>
+      decltype(auto) maybe_record_exit_barrier(FutureT&& fut) {
+        if (!fut.available()) {
+	  this->event.exit_barrier_event.trigger(this->op);
+	}
+	return std::forward<FutureT>(fut);
+      }
+
     protected:
-      void record_blocking(const T& blocker) override {
+      void record_blocking(T& blocker) override {
 	this->event.trigger(op, blocker);
+        blocker.add_event(this->event);
       }
 
       const OpT& op;
+
     };
 
     void dump(ceph::Formatter *f) const {
-      detail::dump_blocking_event(typeid(T).name(),
-				  internal_backend.timestamp,
-				  internal_backend.blocker,
-				  f);
+      auto demangled_name = boost::core::demangle(typeid(T).name());
+      detail::dump_blocking_event(
+	demangled_name.c_str(),
+	internal_backend.timestamp,
+	internal_backend.blocker,
+	f);
+      exit_barrier_event.dump(f);
     }
   };
 
-  virtual ~BlockerT() = default;
+  virtual ~BlockerT() {
+    for (auto &event : event_list) {
+      event.internal_backend.blocker = nullptr;
+    }
+    event_list.clear();
+  }
   template <class TriggerT, class... Args>
   decltype(auto) track_blocking(TriggerT&& trigger, Args&&... args) {
     return std::forward<TriggerT>(trigger).maybe_record_blocking(
-      std::forward<Args>(args)..., static_cast<const T&>(*this));
+      std::forward<Args>(args)..., *(static_cast<T*>(this)));
   }
 
 private:
   const char *get_type_name() const final {
     return static_cast<const T*>(this)->type_name;
+  }
+  using event_list_t = boost::intrusive::list<BlockingEvent>;
+  event_list_t event_list;
+  void add_event(BlockingEvent& event) {
+    event_list.push_back(event);
+  }
+  void delete_event(BlockingEvent& event) {
+    event_list.erase(event_list_t::s_iterator_to(event));
   }
 };
 
@@ -248,7 +289,7 @@ struct AggregateBlockingEvent {
   public:
     template <class FutureT>
     auto maybe_record_blocking(FutureT&& fut,
-			       const typename T::Blocker& blocker) {
+			       typename T::Blocker& blocker) {
       // AggregateBlockingEvent is supposed to be used on relatively cold
       // paths (recovery), so we don't need to worry about the dynamic
       // polymothps / dynamic memory's overhead.
@@ -307,12 +348,15 @@ private:
  * an interface for registering ops in flight and dumping
  * diagnostic information.
  */
-class Operation : public boost::intrusive_ref_counter<
-  Operation, boost::thread_unsafe_counter> {
+class Operation : public boost::intrusive_ref_counter<Operation> {
  public:
-  uint64_t get_id() const {
+  using id_t = uint64_t;
+  static constexpr id_t NULL_ID = std::numeric_limits<uint64_t>::max();
+  id_t get_id() const {
     return id;
   }
+
+  static constexpr bool is_trackable = false;
 
   virtual unsigned get_type() const = 0;
   virtual const char *get_type_name() const = 0;
@@ -327,8 +371,8 @@ class Operation : public boost::intrusive_ref_counter<
 
   registry_hook_t registry_hook;
 
-  uint64_t id = 0;
-  void set_id(uint64_t in_id) {
+  id_t id = 0;
+  void set_id(id_t in_id) {
     id = in_id;
   }
 
@@ -390,21 +434,17 @@ public:
 
 template <size_t NUM_REGISTRIES>
 class OperationRegistryT : public OperationRegistryI {
+  Operation::id_t next_id = 0;
   std::array<
     op_list,
     NUM_REGISTRIES
   > registries;
 
-  std::array<
-    uint64_t,
-    NUM_REGISTRIES
-  > op_id_counters = {};
-
 protected:
   void do_register(Operation *op) final {
     const auto op_type = op->get_type();
     registries[op_type].push_back(*op);
-    op->set_id(++op_id_counters[op_type]);
+    op->set_id(++next_id);
   }
 
   bool registries_empty() const final {
@@ -414,7 +454,15 @@ protected:
 			 return opl.empty();
 		       });
   }
-public:
+
+protected:
+  OperationRegistryT(core_id_t core)
+    // Use core to initialize upper 8 bits of counters to ensure that
+    // ids generated by different cores are disjoint
+    : next_id(static_cast<id_t>(core) <<
+	      (std::numeric_limits<id_t>::digits - 8))
+  {}
+
   template <size_t REGISTRY_INDEX>
   const op_list& get_registry() const {
     static_assert(
@@ -428,6 +476,29 @@ public:
       REGISTRY_INDEX < std::tuple_size<decltype(registries)>::value);
     return registries[REGISTRY_INDEX];
   }
+
+public:
+  /// Iterate over live ops
+  template <typename F>
+  void for_each_op(F &&f) const {
+    for (const auto &registry: registries) {
+      for (const auto &op: registry) {
+	std::invoke(f, op);
+      }
+    }
+  }
+
+  /// Removes op from registry
+  void remove_from_registry(Operation &op) {
+    const auto op_type = op.get_type();
+    registries[op_type].erase(op_list::s_iterator_to(op));
+  }
+
+  /// Adds op to registry
+  void add_to_registry(Operation &op) {
+    const auto op_type = op.get_type();
+    registries[op_type].push_back(op);
+  }
 };
 
 class PipelineExitBarrierI {
@@ -435,32 +506,78 @@ public:
   using Ref = std::unique_ptr<PipelineExitBarrierI>;
 
   /// Waits for exit barrier
-  virtual seastar::future<> wait() = 0;
+  virtual std::optional<seastar::future<>> wait() = 0;
 
-  /// Releases pipeline stage, can only be called after wait
-  virtual void exit() = 0;
-
-  /// Releases pipeline resources without waiting on barrier
-  virtual void cancel() = 0;
-
-  /// Must ensure that resources are released, likely by calling cancel()
+  /// Releases pipeline resources.
+  /// If wait() has been called,
+  /// must release after the wait future is resolved.
   virtual ~PipelineExitBarrierI() {}
 };
 
 template <class T>
 class PipelineStageIT : public BlockerT<T> {
 public:
-  template <class... Args>
-  decltype(auto) enter(Args&&... args) {
-    return static_cast<T*>(this)->enter(std::forward<Args>(args)...);
-  }
+#ifndef NDEBUG
+  const core_id_t core = seastar::this_shard_id();
+#endif
 };
 
 class PipelineHandle {
   PipelineExitBarrierI::Ref barrier;
 
-  auto wait_barrier() {
-    return barrier ? barrier->wait() : seastar::now();
+  std::optional<seastar::future<>> wait_barrier() {
+    return barrier ? barrier->wait() : std::nullopt;
+  }
+
+  template <typename OpT, typename T>
+  std::optional<seastar::future<>>
+  do_enter_maybe_sync(
+      T &stage,
+      typename T::BlockingEvent::template Trigger<OpT>&& t,
+      PipelineExitBarrierI::Ref&& moved_barrier) {
+    assert(!barrier);
+    if constexpr (!T::is_enter_sync) {
+      auto fut = t.maybe_record_blocking(stage.enter(t), stage);
+      return std::move(fut
+      ).then([this, t=std::move(t),
+              moved_barrier=std::move(moved_barrier)](auto &&barrier_ref) {
+        // destruct moved_barrier and unlock after entered
+        assert(!barrier);
+        barrier = std::move(barrier_ref);
+        return seastar::now();
+      });
+    } else {
+      auto barrier_ref = stage.enter(t);
+      // destruct moved_barrier and unlock after entered
+      barrier = std::move(barrier_ref);
+      return std::nullopt;
+    }
+  }
+
+  template <typename OpT, typename T>
+  std::optional<seastar::future<>>
+  enter_maybe_sync(T &stage, typename T::BlockingEvent::template Trigger<OpT>&& t) {
+    assert(stage.core == seastar::this_shard_id());
+    auto wait_fut = wait_barrier();
+    auto moved_barrier = std::move(barrier);
+    barrier.reset();
+    if (wait_fut.has_value()) {
+      return wait_fut.value(
+      ).then([this, &stage, t=std::move(t),
+              moved_barrier=std::move(moved_barrier)]() mutable {
+        auto ret = do_enter_maybe_sync<OpT, T>(
+            stage, std::move(t), std::move(moved_barrier));
+        if constexpr (!T::is_enter_sync) {
+          return std::move(ret.value());
+        } else {
+          assert(ret == std::nullopt);
+          return seastar::now();
+        }
+      });
+    } else {
+      return do_enter_maybe_sync<OpT, T>(
+          stage, std::move(t), std::move(moved_barrier));
+    }
   }
 
 public:
@@ -480,15 +597,27 @@ public:
   template <typename OpT, typename T>
   seastar::future<>
   enter(T &stage, typename T::BlockingEvent::template Trigger<OpT>&& t) {
-    return wait_barrier().then([this, &stage, t=std::move(t)] () mutable {
-      auto fut = t.maybe_record_blocking(stage.enter(t), stage);
-      exit();
-      return std::move(fut).then(
-        [this, t=std::move(t)](auto &&barrier_ref) mutable {
-        barrier = std::move(barrier_ref);
-        return seastar::now();
-      });
-    });
+    auto ret = enter_maybe_sync<OpT, T>(stage, std::move(t));
+    if (ret.has_value()) {
+      return std::move(ret.value());
+    } else {
+      return seastar::now();
+    }
+  }
+
+  /**
+   * Synchronously leaves the previous stage and enters the next stage.
+   * Required for the use case which needs ordering upon entering an
+   * ordered concurrent phase.
+   */
+  template <typename OpT, typename T>
+  void
+  enter_sync(T &stage, typename T::BlockingEvent::template Trigger<OpT>&& t) {
+    static_assert(T::is_enter_sync);
+    auto ret = enter_maybe_sync<OpT, T>(stage, std::move(t));
+    // Expect that barrier->wait() (leaving the previous stage)
+    // also returns nullopt, see enter_maybe_sync() above
+    ceph_assert(!ret.has_value());
   }
 
   /**
@@ -496,8 +625,16 @@ public:
    */
   seastar::future<> complete() {
     auto ret = wait_barrier();
+    auto moved_barrier = std::move(barrier);
     barrier.reset();
-    return ret;
+    if (ret) {
+      return std::move(ret.value()
+      ).then([moved_barrier=std::move(moved_barrier)] {
+        // destruct moved_barrier and unlock after wait()
+      });
+    } else {
+      return seastar::now();
+    }
   }
 
   /**
@@ -519,47 +656,64 @@ public:
  */
 template <class T>
 class OrderedExclusivePhaseT : public PipelineStageIT<T> {
-  void dump_detail(ceph::Formatter *f) const final {}
+  void dump_detail(ceph::Formatter *f) const final {
+    f->dump_unsigned("waiting", waiting);
+    if (held_by != Operation::NULL_ID) {
+      f->dump_unsigned("held_by_operation_id", held_by);
+    }
+  }
 
   class ExitBarrier final : public PipelineExitBarrierI {
     OrderedExclusivePhaseT *phase;
+    Operation::id_t op_id;
   public:
-    ExitBarrier(OrderedExclusivePhaseT *phase) : phase(phase) {}
+    ExitBarrier(OrderedExclusivePhaseT &phase, Operation::id_t id)
+      : phase(&phase), op_id(id) {}
 
-    seastar::future<> wait() final {
-      return seastar::now();
-    }
-
-    void exit() final {
-      if (phase) {
-	phase->exit();
-	phase = nullptr;
-      }
-    }
-
-    void cancel() final {
-      exit();
+    std::optional<seastar::future<>> wait() final {
+      return std::nullopt;
     }
 
     ~ExitBarrier() final {
-      cancel();
+      assert(phase);
+      assert(phase->core == seastar::this_shard_id());
+      phase->exit(op_id);
     }
   };
 
-  void exit() {
+  void exit(Operation::id_t op_id) {
+    clear_held_by(op_id);
     mutex.unlock();
   }
 
 public:
-  template <class... IgnoreArgs>
-  seastar::future<PipelineExitBarrierI::Ref> enter(IgnoreArgs&&...) {
-    return mutex.lock().then([this] {
-      return PipelineExitBarrierI::Ref(new ExitBarrier{this});
+  static constexpr bool is_enter_sync = false;
+
+  template <class TriggerT>
+  seastar::future<PipelineExitBarrierI::Ref> enter(TriggerT& t) {
+    waiting++;
+    return mutex.lock().then([this, op_id=t.get_op().get_id()] {
+      ceph_assert_always(waiting > 0);
+      --waiting;
+      set_held_by(op_id);
+      return PipelineExitBarrierI::Ref(new ExitBarrier{*this, op_id});
     });
   }
 
 private:
+  void set_held_by(Operation::id_t id) {
+    ceph_assert_always(held_by == Operation::NULL_ID);
+    held_by = id;
+  }
+
+  void clear_held_by(Operation::id_t id) {
+    ceph_assert_always(held_by == id);
+    held_by = Operation::NULL_ID;
+  }
+
+  unsigned waiting = 0;
   seastar::shared_mutex mutex;
+  Operation::id_t held_by = Operation::NULL_ID;
 };
 
 /**
@@ -569,29 +723,6 @@ private:
  */
 template <class T>
 class OrderedConcurrentPhaseT : public PipelineStageIT<T> {
-  using base_t = PipelineStageIT<T>;
-public:
-  struct BlockingEvent : base_t::BlockingEvent {
-    using base_t::BlockingEvent::BlockingEvent;
-
-    struct ExitBarrierEvent : TimeEvent<ExitBarrierEvent> {};
-
-    template <class OpT>
-    struct Trigger : base_t::BlockingEvent::template Trigger<OpT> {
-      using base_t::BlockingEvent::template Trigger<OpT>::Trigger;
-
-      template <class FutureT>
-      decltype(auto) maybe_record_exit_barrier(FutureT&& fut) {
-        if (!fut.available()) {
-	  exit_barrier_event.trigger(this->op);
-	}
-	return std::forward<FutureT>(fut);
-      }
-
-      ExitBarrierEvent exit_barrier_event;
-    };
-  };
-
 private:
   void dump_detail(ceph::Formatter *f) const final {}
 
@@ -602,11 +733,11 @@ private:
     TriggerT trigger;
   public:
     ExitBarrier(
-      OrderedConcurrentPhaseT *phase,
+      OrderedConcurrentPhaseT &phase,
       seastar::future<> &&barrier,
-      TriggerT& trigger) : phase(phase), barrier(std::move(barrier)), trigger(trigger) {}
+      TriggerT& trigger) : phase(&phase), barrier(std::move(barrier)), trigger(trigger) {}
 
-    seastar::future<> wait() final {
+    std::optional<seastar::future<>> wait() final {
       assert(phase);
       assert(barrier);
       auto ret = std::move(*barrier);
@@ -614,33 +745,32 @@ private:
       return trigger.maybe_record_exit_barrier(std::move(ret));
     }
 
-    void exit() final {
-      if (barrier) {
-	static_cast<void>(
-	  std::move(*barrier).then([phase=this->phase] { phase->mutex.unlock(); }));
-	barrier = std::nullopt;
-	phase = nullptr;
-      }
-      if (phase) {
-	phase->mutex.unlock();
-	phase = nullptr;
-      }
-    }
-
-    void cancel() final {
-      exit();
-    }
-
     ~ExitBarrier() final {
-      cancel();
+      assert(phase);
+      assert(phase->core == seastar::this_shard_id());
+      if (barrier) {
+        // wait() hasn't been called
+
+        // FIXME: should not discard future,
+        // it's discouraged by seastar and may cause shutdown issues.
+        std::ignore = std::move(*barrier
+        ).then([phase=this->phase] {
+          phase->mutex.unlock();
+        });
+      } else {
+        // wait() has been called, must unlock
+        // after the wait() future is resolved.
+        phase->mutex.unlock();
+      }
     }
   };
 
 public:
+  static constexpr bool is_enter_sync = true;
+
   template <class TriggerT>
-  seastar::future<PipelineExitBarrierI::Ref> enter(TriggerT& t) {
-    return seastar::make_ready_future<PipelineExitBarrierI::Ref>(
-      new ExitBarrier<TriggerT>{this, mutex.lock(), t});
+  PipelineExitBarrierI::Ref enter(TriggerT& t) {
+    return std::make_unique<ExitBarrier<TriggerT>>(*this, mutex.lock(), t);
   }
 
 private:
@@ -660,23 +790,24 @@ class UnorderedStageT : public PipelineStageIT<T> {
   public:
     ExitBarrier() = default;
 
-    seastar::future<> wait() final {
-      return seastar::now();
+    std::optional<seastar::future<>> wait() final {
+      return std::nullopt;
     }
-
-    void exit() final {}
-
-    void cancel() final {}
 
     ~ExitBarrier() final {}
   };
 
 public:
-  template <class... IgnoreArgs>
-  seastar::future<PipelineExitBarrierI::Ref> enter(IgnoreArgs&&...) {
-    return seastar::make_ready_future<PipelineExitBarrierI::Ref>(
-      new ExitBarrier);
+  static constexpr bool is_enter_sync = true;
+
+  template <class TriggerT>
+  PipelineExitBarrierI::Ref enter(TriggerT&) {
+    return std::make_unique<ExitBarrier>();
   }
 };
 
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::Operation> : fmt::ostream_formatter {};
+#endif

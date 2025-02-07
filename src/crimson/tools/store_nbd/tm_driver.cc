@@ -19,26 +19,35 @@ seastar::future<> TMDriver::write(
 {
   logger().debug("Writing offset {}", offset);
   assert(offset % device->get_block_size() == 0);
-  assert((ptr.length() % (size_t)device->get_block_size()) == 0);
+  assert((ptr.length() % device->get_block_size()) == 0);
   return seastar::do_with(ptr, [this, offset](auto& ptr) {
     return repeat_eagain([this, offset, &ptr] {
       return tm->with_transaction_intr(
         Transaction::src_t::MUTATE,
         "write",
+	CACHE_HINT_TOUCH,
         [this, offset, &ptr](auto& t)
       {
-        return tm->dec_ref(t, offset
-        ).si_then([](auto){}).handle_error_interruptible(
+        return tm->remove(t, laddr_t::from_byte_offset(offset)
+        ).discard_result().handle_error_interruptible(
           crimson::ct_error::enoent::handle([](auto) { return seastar::now(); }),
           crimson::ct_error::pass_further_all{}
         ).si_then([this, offset, &t, &ptr] {
           logger().debug("dec_ref complete");
-          return tm->alloc_extent<TestBlock>(t, offset, ptr.length());
-        }).si_then([this, offset, &t, &ptr](auto ext) {
-          boost::ignore_unused(offset);  // avoid clang warning;
-          assert(ext->get_laddr() == (size_t)offset);
-          assert(ext->get_bptr().length() == ptr.length());
-          ext->get_bptr().swap(ptr);
+          return tm->alloc_data_extents<TestBlock>(t, laddr_t::from_byte_offset(offset), ptr.length());
+        }).si_then([this, offset, &t, &ptr](auto extents) mutable {
+	  boost::ignore_unused(offset);  // avoid clang warning;
+	  auto off = offset;
+	  auto left = ptr.length();
+	  size_t written = 0;
+	  for (auto &ext : extents) {
+	    assert(ext->get_laddr() == laddr_t::from_byte_offset(off));
+	    assert(ext->get_bptr().length() <= left);
+	    ptr.copy_out(written, ext->get_length(), ext->get_bptr().c_str());
+	    off += ext->get_length();
+	    left -= ext->get_length();
+	  }
+	  assert(!left);
           logger().debug("submitting transaction");
           return tm->submit_transaction(t);
         });
@@ -71,14 +80,17 @@ TMDriver::read_extents_ret TMDriver::read_extents(
 	      "read_extents: get_extent {}~{}",
 	      pin->get_val(),
 	      pin->get_length());
-	    return tm->pin_to_extent<TestBlock>(
+	    return tm->read_pin<TestBlock>(
 	      t,
 	      std::move(pin)
-	    ).si_then([&ret](auto ref) mutable {
-	      ret.push_back(std::make_pair(ref->get_laddr(), ref));
+	    ).si_then([&ret](auto maybe_indirect_extent) mutable {
+	      assert(!maybe_indirect_extent.is_indirect());
+	      assert(!maybe_indirect_extent.is_clone);
+	      auto& e = maybe_indirect_extent.extent;
+	      ret.push_back(std::make_pair(e->get_laddr(), e));
 	      logger().debug(
 		"read_extents: got extent {}",
-		*ref);
+		*e);
 	      return seastar::now();
 	    });
 	  }).si_then([&ret] {
@@ -94,26 +106,27 @@ seastar::future<bufferlist> TMDriver::read(
 {
   logger().debug("Reading offset {}", offset);
   assert(offset % device->get_block_size() == 0);
-  assert(size % (size_t)device->get_block_size() == 0);
+  assert(size % device->get_block_size() == 0);
   auto blptrret = std::make_unique<bufferlist>();
   auto &blret = *blptrret;
   return repeat_eagain([=, &blret, this] {
     return tm->with_transaction_intr(
       Transaction::src_t::READ,
       "read",
+      CACHE_HINT_TOUCH,
       [=, &blret, this](auto& t)
     {
-      return read_extents(t, offset, size
+      return read_extents(t, laddr_t::from_byte_offset(offset), size
       ).si_then([=, &blret](auto ext_list) {
-        size_t cur = offset;
+        auto cur = laddr_t::from_byte_offset(offset);
         for (auto &i: ext_list) {
           if (cur != i.first) {
             assert(cur < i.first);
-            blret.append_zero(i.first - cur);
+            blret.append_zero(i.first.template get_byte_distance<size_t>(cur));
             cur = i.first;
           }
           blret.append(i.second->get_bptr());
-          cur += i.second->get_bptr().length();
+	  cur = (cur + i.second->get_bptr().length()).checked_to_laddr();
         }
         if (blret.length() != size) {
           assert(blret.length() < size);
@@ -131,11 +144,13 @@ seastar::future<bufferlist> TMDriver::read(
 
 void TMDriver::init()
 {
+  shard_stats = {};
+
   std::vector<Device*> sec_devices;
 #ifndef NDEBUG
-  tm = make_transaction_manager(device.get(), sec_devices, true);
+  tm = make_transaction_manager(device.get(), sec_devices, shard_stats, true);
 #else
-  tm = make_transaction_manager(device.get(), sec_devices, false);
+  tm = make_transaction_manager(device.get(), sec_devices, shard_stats, false);
 #endif
 }
 
@@ -146,14 +161,14 @@ void TMDriver::clear()
 
 size_t TMDriver::get_size() const
 {
-  return device->get_size() * .5;
+  return device->get_available_size() * .5;
 }
 
 seastar::future<> TMDriver::mkfs()
 {
   assert(config.path);
   logger().debug("mkfs");
-  return Device::make_device(*config.path
+  return Device::make_device(*config.path, device_type_t::SSD
   ).then([this](DeviceRef dev) {
     device = std::move(dev);
     seastore_meta_t meta;
@@ -162,7 +177,7 @@ seastar::future<> TMDriver::mkfs()
       device_config_t{
         true,
         (magic_t)std::rand(),
-        device_type_t::SEGMENTED,
+        device_type_t::SSD,
         0,
         meta,
         secondary_device_set_t()});
@@ -195,7 +210,7 @@ seastar::future<> TMDriver::mount()
 {
   return (config.mkfs ? mkfs() : seastar::now()
   ).then([this] {
-    return Device::make_device(*config.path);
+    return Device::make_device(*config.path, device_type_t::SSD);
   }).then([this](DeviceRef dev) {
     device = std::move(dev);
     return device->mount();

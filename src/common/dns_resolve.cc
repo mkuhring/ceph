@@ -12,10 +12,11 @@
  *
  */
 
+#include "dns_resolve.h"
+
 #include <arpa/inet.h>
 
 #include "include/scope_guard.h"
-#include "dns_resolve.h"
 #include "common/debug.h"
 
 #define dout_subsys ceph_subsys_
@@ -56,6 +57,7 @@ DNSResolver::~DNSResolver()
 #ifdef HAVE_RES_NQUERY
   for (auto iter = states.begin(); iter != states.end(); ++iter) {
     struct __res_state *s = *iter;
+    res_nclose(s);
     delete s;
   }
 #endif

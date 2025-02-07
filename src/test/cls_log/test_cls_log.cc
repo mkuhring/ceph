@@ -79,6 +79,7 @@ void generate_log(librados::IoCtx& ioctx, string& oid, int max, utime_t& start_t
   int i;
 
   for (i = 0; i < max; i++) {
+    // coverity[store_truncates_time_t:SUPPRESS]
     uint32_t secs = start_time.sec();
     if (modify_time)
       secs += i;
@@ -94,6 +95,7 @@ void generate_log(librados::IoCtx& ioctx, string& oid, int max, utime_t& start_t
 
 utime_t get_time(utime_t& start_time, int i, bool modify_time)
 {
+  // coverity[store_truncates_time_t:SUPPRESS]
   uint32_t secs = start_time.sec();
   if (modify_time)
     secs += i;
@@ -330,7 +332,6 @@ TEST_F(cls_log, trim_by_marker)
   utime_t start_time = ceph_clock_now();
   generate_log(ioctx, oid, 10, start_time, true);
 
-  utime_t zero_time;
   std::vector<cls_log_entry> log1;
   {
     list<cls_log_entry> entries;

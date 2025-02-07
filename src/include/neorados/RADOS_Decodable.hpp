@@ -24,40 +24,19 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/core.h>
+#if FMT_VERSION >= 90000
+#include <fmt/ostream.h>
+#endif
+
 namespace neorados {
 struct Entry {
   std::string nspace;
   std::string oid;
   std::string locator;
 
-  Entry() {}
-  Entry(std::string nspace, std::string oid, std::string locator) :
-    nspace(std::move(nspace)), oid(std::move(oid)), locator(locator) {}
+  friend auto operator <=>(const Entry&, const Entry&) = default;
 };
-inline bool operator ==(const Entry& l, const Entry r) {
-  return std::tie(l.nspace, l.oid, l.locator) ==
-    std::tie(r.nspace, r.oid, r.locator);
-}
-inline bool operator !=(const Entry& l, const Entry r) {
-  return std::tie(l.nspace, l.oid, l.locator) !=
-    std::tie(r.nspace, r.oid, r.locator);
-}
-inline bool operator <(const Entry& l, const Entry r) {
-  return std::tie(l.nspace, l.oid, l.locator) <
-    std::tie(r.nspace, r.oid, r.locator);
-}
-inline bool operator <=(const Entry& l, const Entry r) {
-  return std::tie(l.nspace, l.oid, l.locator) <=
-    std::tie(r.nspace, r.oid, r.locator);
-}
-inline bool operator >=(const Entry& l, const Entry r) {
-  return std::tie(l.nspace, l.oid, l.locator) >=
-    std::tie(r.nspace, r.oid, r.locator);
-}
-inline bool operator >(const Entry& l, const Entry r) {
-  return std::tie(l.nspace, l.oid, l.locator) >
-    std::tie(r.nspace, r.oid, r.locator);
-}
 
 inline std::ostream& operator <<(std::ostream& out, const Entry& entry) {
   if (!entry.nspace.empty())
@@ -103,5 +82,9 @@ struct hash<::neorados::Entry> {
   }
 };
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<neorados::Entry> : fmt::ostream_formatter {};
+#endif
 
 #endif // RADOS_DECODABLE_HPP

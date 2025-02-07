@@ -19,12 +19,12 @@ public:
     : interrupt(interrupt) {}
 
   template <typename T>
-  std::pair<bool, std::optional<T>> may_interrupt() {
-    if (interrupt)
-      return std::pair<bool, std::optional<T>>(
-	  true, seastar::futurize<T>::make_exception_future(test_interruption()));
-    else
-      return std::pair<bool, std::optional<T>>(false, std::optional<T>());
+  std::optional<T> may_interrupt() {
+    if (interrupt) {
+      return seastar::futurize<T>::make_exception_future(test_interruption());
+    } else {
+      return std::optional<T>();
+    }
   }
 
   template <typename T>
@@ -64,9 +64,10 @@ TEST_F(seastar_test_suite_t, basic)
 	  return seastar::now();
 	}, errorator<ct_error::enoent>::all_same_way([] {
 	  ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+	  return seastar::now();
 	  })
 	);
-      }, [](std::exception_ptr) {}, false).get0();
+      }, [](std::exception_ptr) {}, false).get();
 
     interruptor::with_interruption(
       [] {
@@ -78,7 +79,7 @@ TEST_F(seastar_test_suite_t, basic)
       }, [](std::exception_ptr) {
 	ceph_assert(!interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
 	return seastar::now();
-      }, true).get0();
+      }, true).get();
 
 
   });
@@ -146,12 +147,17 @@ TEST_F(seastar_test_suite_t, loops)
 		return seastar::now();
 	      }, errorator<ct_error::enoent>::all_same_way([] {
 		ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+		return seastar::now();
 	      }));
 	    });
 	  });
 	}).then_interruptible([] {
 	  std::cout << "test errorated future do_for_each" << std::endl;
-	  std::vector<int> vec = {1, 2};
+	  std::vector<int> vec;
+	  // set a big enough iteration times to test if there is stack overflow in do_for_each
+	  for (int i = 0; i < 1000000; i++) {
+	    vec.push_back(i);
+	  }
 	  return seastar::do_with(std::move(vec), [](auto& vec) {
 	    using namespace std::chrono_literals;
 	    return interruptor::make_interruptible(seastar::now()).then_interruptible([&vec] {
@@ -163,6 +169,7 @@ TEST_F(seastar_test_suite_t, loops)
 		return seastar::now();
 	      }, errorator<ct_error::enoent>::all_same_way([] {
 		ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+		return seastar::now();
 	      }));
 	    });
 	  });
@@ -170,7 +177,7 @@ TEST_F(seastar_test_suite_t, loops)
 	  ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
 	  return seastar::now();
 	});
-      }, [](std::exception_ptr) {}, false).get0();
+      }, [](std::exception_ptr) {}, false).get();
   });
 }
 
@@ -201,7 +208,7 @@ TEST_F(seastar_test_suite_t, errorated)
 	return base_iertr::now();
       }
     );
-    ret.unsafe_get0();
+    ret.unsafe_get();
   });
 }
 
@@ -214,7 +221,7 @@ TEST_F(seastar_test_suite_t, errorated_value)
 	  1
 	);
       });
-    EXPECT_EQ(ret.unsafe_get0(), 1);
+    EXPECT_EQ(ret.unsafe_get(), 1);
   });
 }
 
@@ -229,7 +236,7 @@ TEST_F(seastar_test_suite_t, expand_errorated_value)
 	  return base2_iertr::make_ready_future<>();
 	});
       });
-    ret.unsafe_get0();
+    ret.unsafe_get();
   });
 }
 
@@ -253,7 +260,48 @@ TEST_F(seastar_test_suite_t, interruptible_async)
       ceph_assert(interruptible::interrupt_cond<
 	TestInterruptCondition>.ref_count == 1);
       return fut;
-    }, [](std::exception_ptr) {}, false).get0();
+    }, [](std::exception_ptr) {}, false).get();
+  });
+}
+
+TEST_F(seastar_test_suite_t, DISABLED_nested_interruptors)
+{
+  run_async([] {
+    base_ertr::future<> ret = with_intr(
+      []() {
+	return base_iertr::now().safe_then_interruptible([]() {
+          return with_intr(
+            []() {
+              return base_iertr::now();
+            }
+          );
+        });
+      }
+    );
+    ret.unsafe_get();
+  });
+}
+
+TEST_F(seastar_test_suite_t, interruptible_repeat_eagain)
+{
+  using interruptor =
+    interruptible::interruptor<TestInterruptCondition>;
+  run_async([] {
+    interruptor::with_interruption([] {
+      return seastar::do_with(
+	0,
+	[](auto &i) {
+	return interruptor::repeat_eagain([&i]() -> base_iertr::future<> {
+	  if (++i < 5) {
+	    return crimson::ct_error::eagain::make();
+	  }
+	  return base_iertr::now();
+	}).si_then([&i] {
+	  std::cout << i << std::endl;
+	  ceph_assert(i == 5);
+	});
+      });
+    }, [](std::exception_ptr) {}, false).unsafe_get();
   });
 }
 
@@ -273,7 +321,7 @@ TEST_F(seastar_test_suite_t, handle_error)
 	  return base_iertr::now();
 	});
       });
-    ret.unsafe_get0();
+    ret.unsafe_get();
   });
 }
 #endif

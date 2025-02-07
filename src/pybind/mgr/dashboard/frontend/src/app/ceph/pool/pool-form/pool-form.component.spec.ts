@@ -135,28 +135,25 @@ describe('PoolFormComponent', () => {
 
   const routes: Routes = [{ path: '404', component: ErrorComponent }];
 
-  configureTestBed(
-    {
-      declarations: [ErrorComponent],
-      imports: [
-        BrowserAnimationsModule,
-        HttpClientTestingModule,
-        RouterTestingModule.withRoutes(routes),
-        ToastrModule.forRoot(),
-        NgbNavModule,
-        PoolModule,
-        SharedModule,
-        NgbModalModule
-      ],
-      providers: [
-        ErasureCodeProfileService,
-        NgbActiveModal,
-        SelectBadgesComponent,
-        { provide: ActivatedRoute, useValue: { params: of({ name: 'somePoolName' }) } }
-      ]
-    },
-    [CriticalConfirmationModalComponent]
-  );
+  configureTestBed({
+    declarations: [ErrorComponent],
+    imports: [
+      BrowserAnimationsModule,
+      HttpClientTestingModule,
+      RouterTestingModule.withRoutes(routes),
+      ToastrModule.forRoot(),
+      NgbNavModule,
+      PoolModule,
+      SharedModule,
+      NgbModalModule
+    ],
+    providers: [
+      ErasureCodeProfileService,
+      NgbActiveModal,
+      SelectBadgesComponent,
+      { provide: ActivatedRoute, useValue: { params: of({ name: 'somePoolName' }) } }
+    ]
+  });
 
   let navigationSpy: jasmine.Spy;
 
@@ -528,7 +525,7 @@ describe('PoolFormComponent', () => {
       expect(component.getMaxSize()).toBe(3);
     });
 
-    it('should return the osd count as minimum if its lower the the rule minimum', () => {
+    it('should return the osd count as minimum if its lower the rule minimum', () => {
       component.info.osd_count = 0;
       formHelper.setValue('crushRule', component.info.crush_rules_replicated[0]);
       const control = form.get('crushRule');
@@ -1099,6 +1096,7 @@ describe('PoolFormComponent', () => {
         // Mock that no ec profiles exist
         infoReturn.erasure_code_profiles = [];
         setUpPoolComponent();
+        component.data.applications.selected = ['cephfs', 'rgw'];
         setMultipleValues({
           name: 'minECPool',
           poolType: 'erasure',
@@ -1108,37 +1106,46 @@ describe('PoolFormComponent', () => {
           pool: 'minECPool',
           pool_type: 'erasure',
           pg_autoscale_mode: 'off',
-          pg_num: 4
+          pg_num: 4,
+          application_metadata: ['cephfs', 'rgw']
         });
       });
 
       it('creates ec pool with erasure coded profile', () => {
+        component.data.applications.selected = ['cephfs', 'rgw'];
         const ecp = { name: 'ecpMinimalMock' };
         setMultipleValues({
           erasureProfile: ecp
         });
         expectEcSubmit({
-          erasure_code_profile: ecp.name
+          erasure_code_profile: ecp.name,
+          application_metadata: ['cephfs', 'rgw']
         });
       });
 
       it('creates ec pool with ec_overwrite flag', () => {
+        component.data.applications.selected = ['cephfs', 'rgw'];
         setMultipleValues({
           ecOverwrites: true
         });
         expectEcSubmit({
-          flags: ['ec_overwrites']
+          flags: ['ec_overwrites'],
+          application_metadata: ['cephfs', 'rgw']
         });
       });
 
       it('should ignore replicated set settings for ec pools', () => {
+        component.data.applications.selected = ['cephfs', 'rgw'];
         setMultipleValues({
           size: 2 // will be ignored
         });
-        expectEcSubmit({});
+        expectEcSubmit({
+          application_metadata: ['cephfs', 'rgw']
+        });
       });
 
       it('creates a pool with compression', () => {
+        component.data.applications.selected = ['cephfs', 'rgw'];
         setMultipleValues({
           mode: 'passive',
           algorithm: 'lz4',
@@ -1151,7 +1158,8 @@ describe('PoolFormComponent', () => {
           compression_algorithm: 'lz4',
           compression_min_blob_size: 4096,
           compression_max_blob_size: 4194304,
-          compression_required_ratio: 0.7
+          compression_required_ratio: 0.7,
+          application_metadata: ['cephfs', 'rgw']
         });
       });
 
@@ -1199,12 +1207,14 @@ describe('PoolFormComponent', () => {
           size: 2,
           pgNum: 32
         });
+        component.data.applications.selected = ['cephfs', 'rgw'];
         expectValidSubmit({
           pool: 'minRepPool',
           pool_type: 'replicated',
           pg_num: 32,
           pg_autoscale_mode: 'off',
-          size: 2
+          size: 2,
+          application_metadata: ['cephfs', 'rgw']
         });
       });
 
@@ -1218,8 +1228,10 @@ describe('PoolFormComponent', () => {
          *  if type `replicated` is set, pgNum will be set to 256 with the current rule for
          *  a replicated pool.
          */
+        component.data.applications.selected = ['cephfs', 'rgw'];
         expectReplicatedSubmit({
-          pg_num: 256
+          pg_num: 256,
+          application_metadata: ['cephfs', 'rgw']
         });
       });
 
@@ -1228,9 +1240,11 @@ describe('PoolFormComponent', () => {
           max_bytes: 1024 * 1024,
           max_objects: 3000
         });
+        component.data.applications.selected = ['cephfs', 'rgw'];
         expectReplicatedSubmit({
           quota_max_bytes: 1024 * 1024,
-          quota_max_objects: 3000
+          quota_max_objects: 3000,
+          application_metadata: ['cephfs', 'rgw']
         });
       });
 
@@ -1238,10 +1252,12 @@ describe('PoolFormComponent', () => {
         component.currentConfigurationValues = {
           rbd_qos_bps_limit: 55
         };
+        component.data.applications.selected = ['cephfs', 'rgw'];
         expectReplicatedSubmit({
           configuration: {
             rbd_qos_bps_limit: 55
-          }
+          },
+          application_metadata: ['cephfs', 'rgw']
         });
       });
     });
@@ -1384,7 +1400,8 @@ describe('PoolFormComponent', () => {
               compression_max_blob_size: 0,
               compression_min_blob_size: 0,
               compression_required_ratio: 0,
-              pool: 'somePoolName'
+              pool: 'somePoolName',
+              rbd_mirroring: false
             },
             'pool/edit',
             'update'
@@ -1397,7 +1414,8 @@ describe('PoolFormComponent', () => {
             {
               application_metadata: ['ownApp', 'rbd'],
               compression_mode: 'unset',
-              pool: 'somePoolName'
+              pool: 'somePoolName',
+              rbd_mirroring: false
             },
             'pool/edit',
             'update'

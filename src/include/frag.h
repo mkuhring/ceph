@@ -18,16 +18,19 @@
 #include <boost/container/small_vector.hpp>
 
 #include <iostream>
+#include <list>
+#include <set>
 
 #include <stdint.h>
-#include <stdio.h>
 
 #include "buffer.h"
 #include "compact_map.h"
 
 #include "ceph_frag.h"
+#include "common/Formatter.h"
 #include "include/encoding.h"
 #include "include/ceph_assert.h"
+#include "include/types.h" // for operator<<(std::set)
 
 #include "common/dout.h"
 
@@ -158,6 +161,15 @@ public:
     __u32 v;
     ceph::decode_raw(v, p);
     _enc = v;
+  }
+  void dump(ceph::Formatter *f) const {
+    f->dump_unsigned("value", value());
+    f->dump_unsigned("bits", bits());
+  }
+  static void generate_test_instances(std::list<frag_t*>& ls) {
+    ls.push_back(new frag_t);
+    ls.push_back(new frag_t(10, 2));
+    ls.push_back(new frag_t(11, 3));
   }
   bool operator<(const frag_t& b) const
   {
@@ -524,6 +536,11 @@ public:
       f->close_section(); // split
     }
     f->close_section(); // splits
+  }
+
+  static void generate_test_instances(std::list<fragtree_t*>& ls) {
+    ls.push_back(new fragtree_t);
+    ls.push_back(new fragtree_t);
   }
 };
 WRITE_CLASS_ENCODER(fragtree_t)

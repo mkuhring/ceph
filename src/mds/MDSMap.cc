@@ -52,6 +52,8 @@ CompatSet MDSMap::get_compat_set_all() {
   feature_incompat.insert(MDS_FEATURE_INCOMPAT_NOANCHOR);
   feature_incompat.insert(MDS_FEATURE_INCOMPAT_FILE_LAYOUT_V2);
   feature_incompat.insert(MDS_FEATURE_INCOMPAT_SNAPREALM_V2);
+  feature_incompat.insert(MDS_FEATURE_INCOMPAT_MINORLOGSEGMENTS);
+  feature_incompat.insert(MDS_FEATURE_INCOMPAT_QUIESCE_SUBVOLUMES);
 
   return CompatSet(feature_compat, feature_ro_compat, feature_incompat);
 }
@@ -69,6 +71,8 @@ CompatSet MDSMap::get_compat_set_default() {
   feature_incompat.insert(MDS_FEATURE_INCOMPAT_NOANCHOR);
   feature_incompat.insert(MDS_FEATURE_INCOMPAT_FILE_LAYOUT_V2);
   feature_incompat.insert(MDS_FEATURE_INCOMPAT_SNAPREALM_V2);
+  feature_incompat.insert(MDS_FEATURE_INCOMPAT_MINORLOGSEGMENTS);
+  feature_incompat.insert(MDS_FEATURE_INCOMPAT_QUIESCE_SUBVOLUMES);
 
   return CompatSet(feature_compat, feature_ro_compat, feature_incompat);
 }
@@ -177,6 +181,7 @@ void MDSMap::dump(Formatter *f) const
   cephfs_dump_features(f, required_client_features);
   f->close_section();
   f->dump_int("max_file_size", max_file_size);
+  f->dump_int("max_xattr_size", max_xattr_size);
   f->dump_int("last_failure", last_failure);
   f->dump_int("last_failure_osd_epoch", last_failure_osd_epoch);
   f->open_object_section("compat");
@@ -223,7 +228,14 @@ void MDSMap::dump(Formatter *f) const
   f->dump_bool("enabled", enabled);
   f->dump_string("fs_name", fs_name);
   f->dump_string("balancer", balancer);
+  f->dump_string("bal_rank_mask", bal_rank_mask);
   f->dump_int("standby_count_wanted", std::max(0, standby_count_wanted));
+  f->dump_unsigned("qdb_leader", qdb_cluster_leader);
+  f->open_array_section("qdb_cluster");
+  for (auto m: qdb_cluster_members) {
+    f->dump_int("member", m);
+  }
+  f->close_section();
 }
 
 void MDSMap::dump_flags_state(Formatter *f) const
@@ -233,6 +245,9 @@ void MDSMap::dump_flags_state(Formatter *f) const
     f->dump_bool(flag_display.at(CEPH_MDSMAP_ALLOW_SNAPS), allows_snaps());
     f->dump_bool(flag_display.at(CEPH_MDSMAP_ALLOW_MULTIMDS_SNAPS), allows_multimds_snaps());
     f->dump_bool(flag_display.at(CEPH_MDSMAP_ALLOW_STANDBY_REPLAY), allows_standby_replay());
+    f->dump_bool(flag_display.at(CEPH_MDSMAP_REFUSE_CLIENT_SESSION), test_flag(CEPH_MDSMAP_REFUSE_CLIENT_SESSION));
+    f->dump_bool(flag_display.at(CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS), test_flag(CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS));
+    f->dump_bool(flag_display.at(CEPH_MDSMAP_BALANCE_AUTOMATE), test_flag(CEPH_MDSMAP_BALANCE_AUTOMATE));
     f->close_section();
 }
 
@@ -266,6 +281,7 @@ void MDSMap::print(ostream& out) const
   out << "session_timeout\t" << session_timeout << "\n"
       << "session_autoclose\t" << session_autoclose << "\n";
   out << "max_file_size\t" << max_file_size << "\n";
+  out << "max_xattr_size\t" << max_xattr_size << "\n";
   out << "required_client_features\t" << cephfs_stringify_features(required_client_features) << "\n";
   out << "last_failure\t" << last_failure << "\n"
       << "last_failure_osd_epoch\t" << last_failure_osd_epoch << "\n";
@@ -280,7 +296,9 @@ void MDSMap::print(ostream& out) const
   out << "metadata_pool\t" << metadata_pool << "\n";
   out << "inline_data\t" << (inline_data_enabled ? "enabled" : "disabled") << "\n";
   out << "balancer\t" << balancer << "\n";
+  out << "bal_rank_mask\t" << bal_rank_mask << "\n";
   out << "standby_count_wanted\t" << std::max(0, standby_count_wanted) << "\n";
+  out << "qdb_cluster\tleader: " << qdb_cluster_leader << " members: " << qdb_cluster_members << std::endl;
 
   multimap< pair<mds_rank_t, unsigned>, mds_gid_t > foo;
   for (const auto &p : mds_info) {
@@ -371,6 +389,12 @@ void MDSMap::print_flags(std::ostream& out) const {
     out << " " << flag_display.at(CEPH_MDSMAP_ALLOW_MULTIMDS_SNAPS);
   if (allows_standby_replay())
     out << " " << flag_display.at(CEPH_MDSMAP_ALLOW_STANDBY_REPLAY);
+  if (test_flag(CEPH_MDSMAP_REFUSE_CLIENT_SESSION))
+    out << " " << flag_display.at(CEPH_MDSMAP_REFUSE_CLIENT_SESSION);
+  if (test_flag(CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS))
+    out << " " << flag_display.at(CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS);
+  if (test_flag(CEPH_MDSMAP_BALANCE_AUTOMATE))
+    out << " " << flag_display.at(CEPH_MDSMAP_BALANCE_AUTOMATE);
 }
 
 void MDSMap::get_health(list<pair<health_status_t,string> >& summary,
@@ -758,7 +782,7 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
   encode(data_pools, bl);
   encode(cas_pool, bl);
 
-  __u16 ev = 16;
+  __u16 ev = 19;
   encode(ev, bl);
   encode(compat, bl);
   encode(metadata_pool, bl);
@@ -785,6 +809,10 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
     encode(min_compat_client, bl);
   }
   encode(required_client_features, bl);
+  encode(bal_rank_mask, bl);
+  encode(max_xattr_size, bl);
+  encode(qdb_cluster_leader, bl);
+  encode(qdb_cluster_members, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -809,7 +837,6 @@ void MDSMap::decode(bufferlist::const_iterator& p)
 {
   std::map<mds_rank_t,int32_t> inc;  // Legacy field, parse and drop
 
-  cached_up_features = 0;
   DECODE_START_LEGACY_COMPAT_LEN_16(5, 4, 4, p);
   decode(epoch, p);
   decode(flags, p);
@@ -836,7 +863,8 @@ void MDSMap::decode(bufferlist::const_iterator& p)
     decode(cas_pool, p);
   }
 
-  // kclient ignores everything from here
+  // kclient skips most of what's below
+  // see fs/ceph/mdsmap.c for current decoding
   __u16 ev = 1;
   if (struct_v >= 2)
     decode(ev, p);
@@ -930,6 +958,19 @@ void MDSMap::decode(bufferlist::const_iterator& p)
     } else {
       set_min_compat_client(min_compat_client);
     }
+  }
+
+  if (ev >= 17) {
+    decode(bal_rank_mask, p);
+  }
+
+  if (ev >= 18) {
+    decode(max_xattr_size, p);
+  }
+
+  if (ev >= 19) {
+    decode(qdb_cluster_leader, p);
+    decode(qdb_cluster_members, p);
   }
 
   /* All MDS since at least v14.0.0 understand INLINE */
@@ -1085,24 +1126,20 @@ void MDSMap::get_up_mds_set(std::set<mds_rank_t>& s) const {
     s.insert(p->first);
 }
 
-uint64_t MDSMap::get_up_features() {
-  if (!cached_up_features) {
-    bool first = true;
-    for (std::map<mds_rank_t, mds_gid_t>::const_iterator p = up.begin();
-         p != up.end();
-         ++p) {
-      std::map<mds_gid_t, mds_info_t>::const_iterator q =
-        mds_info.find(p->second);
-      ceph_assert(q != mds_info.end());
-      if (first) {
-        cached_up_features = q->second.mds_features;
-        first = false;
-      } else {
-        cached_up_features &= q->second.mds_features;
-      }
+uint64_t MDSMap::get_up_features() const {
+  uint64_t features = 0;
+  bool first = true;
+  for ([[maybe_unused]] auto& [rank, gid] : up) {
+    auto it = mds_info.find(gid);
+    ceph_assert(it != mds_info.end());
+    if (first) {
+      features = it->second.mds_features;
+      first = false;
+    } else {
+      features &= it->second.mds_features;
     }
   }
-  return cached_up_features;
+  return features;
 }
 
 void MDSMap::get_recovery_mds_set(std::set<mds_rank_t>& s) const {
@@ -1168,4 +1205,100 @@ void MDSMap::set_min_compat_client(ceph_release_t version)
 
   std::sort(bits.begin(), bits.end());
   required_client_features = feature_bitset_t(bits);
+}
+
+const std::bitset<MAX_MDS>& MDSMap::get_bal_rank_mask_bitset() const {
+  return bal_rank_mask_bitset;
+}
+
+void MDSMap::set_bal_rank_mask(std::string val)
+{
+  bal_rank_mask = val;
+  dout(10) << "set bal_rank_mask to \"" << bal_rank_mask << "\""<< dendl;
+}
+
+const bool MDSMap::check_special_bal_rank_mask(std::string val, bal_rank_mask_type_t type) const
+{
+  if ((type == BAL_RANK_MASK_TYPE_ANY || type == BAL_RANK_MASK_TYPE_ALL) && (val == "-1" || val == "all")) {
+    return true;
+  }
+  if ((type == BAL_RANK_MASK_TYPE_ANY || type == BAL_RANK_MASK_TYPE_NONE) && (val == "0x0" || val == "0")) {
+    return true;
+  }
+  return false;
+}
+
+void MDSMap::update_num_mdss_in_rank_mask_bitset()
+{
+  int r = -EINVAL;
+
+  if (bal_rank_mask.length() && !check_special_bal_rank_mask(bal_rank_mask, BAL_RANK_MASK_TYPE_ANY)) {
+    std::string bin_string;
+    CachedStackStringStream css;
+
+    r = hex2bin(bal_rank_mask, bin_string, MAX_MDS, *css);
+    if (r == 0) {
+      auto _mds_bal_mask_bitset = std::bitset<MAX_MDS>(bin_string);
+      bal_rank_mask_bitset = _mds_bal_mask_bitset;
+      num_mdss_in_rank_mask_bitset = _mds_bal_mask_bitset.count();
+    } else {
+      dout(10) << css->str() << dendl;
+    }
+  }
+
+  if (r == -EINVAL) {
+    if (check_special_bal_rank_mask(bal_rank_mask, BAL_RANK_MASK_TYPE_NONE)) {
+      dout(10) << "Balancer is disabled with bal_rank_mask " << bal_rank_mask << dendl;
+      bal_rank_mask_bitset.reset();
+      num_mdss_in_rank_mask_bitset = 0;
+    } else {
+      dout(10) << "Balancer distributes mds workloads to all ranks as bal_rank_mask is empty or invalid" << dendl;
+      bal_rank_mask_bitset.set();
+      num_mdss_in_rank_mask_bitset = get_max_mds();
+    }
+  }
+
+  dout(10) << "update num_mdss_in_rank_mask_bitset to " << num_mdss_in_rank_mask_bitset << dendl;
+}
+
+int MDSMap::hex2bin(std::string hex_string, std::string &bin_string, unsigned int max_bits, std::ostream& ss) const
+{
+  static const unsigned int BITS_PER_QUARTET = CHAR_BIT / 2;
+  static const unsigned int BITS_PER_ULLONG = sizeof(unsigned long long) * CHAR_BIT ;
+  static const unsigned int QUARTETS_PER_ULLONG = BITS_PER_ULLONG/BITS_PER_QUARTET;
+  unsigned int offset = 0;
+
+  std::transform(hex_string.begin(), hex_string.end(), hex_string.begin(), ::tolower);
+
+  if (hex_string.substr(0, 2) == "0x") {
+    offset = 2;
+  }
+
+  for (unsigned int i = offset; i < hex_string.size(); i += QUARTETS_PER_ULLONG) {
+    unsigned long long value;
+    try {
+      value = stoull(hex_string.substr(i, QUARTETS_PER_ULLONG), nullptr, 16);
+    } catch (std::invalid_argument const& ex) {
+      ss << "invalid hex value ";
+      return -EINVAL;
+    }
+    auto bit_str = std::bitset<BITS_PER_ULLONG>(value);
+    bin_string += bit_str.to_string();
+  }
+
+  if (bin_string.length() > max_bits) {
+    ss << "a value exceeds max_mds " << max_bits;
+    return -EINVAL;
+  }
+
+  if (bin_string.find('1') == std::string::npos) {
+    ss << "at least one rank must be set";
+    return -EINVAL;
+  }
+
+  if (bin_string.length() < max_bits) {
+    bin_string.insert(0, max_bits - bin_string.length(), '0');
+  }
+
+  return 0;
 }

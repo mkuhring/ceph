@@ -18,15 +18,20 @@
 #include "LogClock.h"
 #include "SubsystemMap.h"
 
+#include <boost/container/vector.hpp>
+
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <syslog.h>
 
+#include <algorithm>
 #include <iostream>
 #include <set>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#include <fmt/ranges.h>
 
 #define MAX_LOG_BUF 65536
 
@@ -49,6 +54,7 @@ Log::Log(const SubsystemMap *s)
     m_recent(DEFAULT_MAX_RECENT)
 {
   m_log_buf.reserve(MAX_LOG_BUF);
+  _configure_stderr();
 }
 
 Log::~Log()
@@ -58,8 +64,44 @@ Log::~Log()
   }
 
   ceph_assert(!is_started());
-  if (m_fd >= 0)
+  if (m_fd >= 0) {
     VOID_TEMP_FAILURE_RETRY(::close(m_fd));
+    m_fd = -1;
+  }
+}
+
+void Log::_configure_stderr()
+{
+#ifndef _WIN32
+  struct stat info;
+  if (int rc = fstat(m_fd_stderr, &info); rc == -1) {
+    std::cerr << "failed to stat stderr: " << cpp_strerror(errno) << std::endl;
+    return;
+  }
+
+  if (S_ISFIFO(info.st_mode)) {
+    /* Set O_NONBLOCK on FIFO stderr file. We want to ensure atomic debug log
+     * writes so they do not get partially read by e.g. buggy container
+     * runtimes. See also IEEE Std 1003.1-2017 and Log::_log_stderr below.
+     *
+     * This isn't required on Windows.
+     */
+    int flags = fcntl(m_fd_stderr, F_GETFL);
+    if (flags == -1) {
+      std::cerr << "failed to get fcntl flags for stderr: " << cpp_strerror(errno) << std::endl;
+      return;
+    }
+    if (!(flags & O_NONBLOCK)) {
+      flags |= O_NONBLOCK;
+      flags = fcntl(m_fd_stderr, F_SETFL, flags);
+      if (flags == -1) {
+        std::cerr << "failed to set fcntl flags for stderr: " << cpp_strerror(errno) << std::endl;
+        return;
+      }
+    }
+    do_stderr_poll = true;
+  }
+#endif // !_WIN32
 }
 
 
@@ -116,8 +158,10 @@ void Log::reopen_log_file()
     return;
   }
   m_flush_mutex_holder = pthread_self();
-  if (m_fd >= 0)
+  if (m_fd >= 0) {
     VOID_TEMP_FAILURE_RETRY(::close(m_fd));
+    m_fd = -1;
+  }
   if (m_log_file.length()) {
     m_fd = ::open(m_log_file.c_str(), O_CREAT|O_WRONLY|O_APPEND|O_CLOEXEC, 0644);
     if (m_fd >= 0 && (m_uid || m_gid)) {
@@ -127,8 +171,6 @@ void Log::reopen_log_file()
 	     << std::endl;
       }
     }
-  } else {
-    m_fd = -1;
   }
   m_flush_mutex_holder = 0;
 }
@@ -258,6 +300,69 @@ void Log::_log_safe_write(std::string_view sv)
   }
 }
 
+void Log::set_stderr_fd(int fd)
+{
+  m_fd_stderr = fd;
+  _configure_stderr();
+}
+
+void Log::_log_stderr(std::string_view strv)
+{
+  if (do_stderr_poll) {
+    auto& prefix = m_log_stderr_prefix;
+    size_t const len = prefix.size() + strv.size();
+    boost::container::small_vector<char, PIPE_BUF> buf;
+    buf.resize(len+1, '\0');
+    memcpy(buf.data(), prefix.c_str(), prefix.size());
+    memcpy(buf.data()+prefix.size(), strv.data(), strv.size());
+
+    char const* const start = buf.data();
+    char const* current = start;
+    while ((size_t)(current-start) < len) {
+      auto chunk = std::min<ssize_t>(PIPE_BUF, len-(ssize_t)(current-start));
+      while (1) {
+        ssize_t rc = write(m_fd_stderr, current, chunk);
+        if (rc == chunk) {
+          current += chunk;
+          break;
+        } else if (rc > 0) {
+          /* According to IEEE Std 1003.1-2017, this cannot happen:
+           *
+           * Write requests to a pipe or FIFO shall be handled in the same way as a regular file with the following exceptions:
+           * ...
+           *   If the O_NONBLOCK flag is set ...
+           *   ...
+           *     A write request for {PIPE_BUF} or fewer bytes shall have the
+           *     following effect: if there is sufficient space available in
+           *     the pipe, write() shall transfer all the data and return the
+           *     number of bytes requested. Otherwise, write() shall transfer
+           *     no data and return -1 with errno set to [EAGAIN].
+           *
+           * In any case, handle misbehavior gracefully by incrementing current.
+           */
+          current += rc;
+          break;
+        } else if (rc == -1) {
+          if (errno == EAGAIN) {
+            struct pollfd pfd[1];
+            pfd[0].fd = m_fd_stderr;
+            pfd[0].events = POLLOUT;
+            poll(pfd, 1, -1);
+            /* ignore errors / success, just retry the write */
+          } else if (errno == EINTR) {
+            continue;
+          } else {
+            /* some other kind of error, no point logging if stderr writes fail */
+            return;
+          }
+        }
+      }
+    }
+  } else {
+    fmt::print(std::cerr, "{}{}", m_log_stderr_prefix, strv);
+  }
+}
+
 void Log::_flush_logbuf()
 {
   if (m_log_buf.size()) {
@@ -268,6 +373,7 @@ void Log::_flush_logbuf()
 
 void Log::_flush(EntryVector& t, bool crash)
 {
+  auto now = mono_clock::now();
   long len = 0;
   if (t.empty()) {
     assert(m_log_buf.empty());
@@ -317,7 +423,7 @@ void Log::_flush(EntryVector& t, bool crash)
       pos[used++] = '\n';
 
       if (do_stderr) {
-        fmt::print(std::cerr, "{}{}", m_log_stderr_prefix, std::string_view(pos, used));
+        _log_stderr(std::string_view(pos, used));
       }
 
       if (do_fd) {
@@ -339,9 +445,28 @@ void Log::_flush(EntryVector& t, bool crash)
       m_journald->log_entry(e);
     }
 
+    {
+      auto [it, _] = m_recent_thread_names.try_emplace(e.m_thread, now, DEFAULT_MAX_THREAD_NAMES);
+      auto& [t, names] = it->second;
+      if (names.size() == 0 || names.front() != e.m_thread_name.data()) {
+        names.push_front(e.m_thread_name.data());
+      }
+      t = now;
+    }
+
     m_recent.push_back(std::move(e));
   }
   t.clear();
+
+  for (auto it = m_recent_thread_names.begin(); it != m_recent_thread_names.end(); ) {
+    auto t = it->second.first;
+    auto since = now - t;
+    if (since > std::chrono::seconds(60*60*24)) {
+      it = m_recent_thread_names.erase(it);
+    } else {
+      ++it;
+    }
+  }
 
   _flush_logbuf();
 }
@@ -389,14 +514,10 @@ void Log::dump_recent()
   _flush(m_flush, false);
 
   _log_message("--- begin dump of recent events ---", true);
-  std::set<pthread_t> recent_pthread_ids;
   {
     EntryVector t;
     t.insert(t.end(), std::make_move_iterator(m_recent.begin()), std::make_move_iterator(m_recent.end()));
     m_recent.clear();
-    for (const auto& e : t) {
-      recent_pthread_ids.emplace(e.m_thread);
-    }
     _flush(t, true);
   }
 
@@ -411,14 +532,15 @@ void Log::dump_recent()
 			   m_stderr_log, m_stderr_crash), true);
 
   _log_message("--- pthread ID / name mapping for recent threads ---", true);
-  for (const auto pthread_id : recent_pthread_ids)
+  for (const auto& [tid, t_names] : m_recent_thread_names)
   {
-    char pthread_name[16] = {0}; //limited by 16B include terminating null byte.
-    ceph_pthread_getname(pthread_id, pthread_name, sizeof(pthread_name));
+    [[maybe_unused]] auto [t, names] = t_names;
     // we want the ID to be printed in the same format as we use for a log entry.
     // The reason is easier grepping.
-    _log_message(fmt::format("  {:x} / {}",
-			     tid_to_int(pthread_id), pthread_name), true);
+    auto msg = fmt::format("  {:x} / {}",
+      tid_to_int(tid),
+      fmt::join(names, ", "));
+    _log_message(msg, true);
   }
 
   _log_message(fmt::format("  max_recent {:9}", m_recent.capacity()), true);

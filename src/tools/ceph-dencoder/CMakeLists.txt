@@ -20,6 +20,7 @@ set_target_properties(ceph-dencoder PROPERTIES
 
 set(denc_plugin_dir ${CEPH_INSTALL_FULL_PKGLIBDIR}/denc)
 add_custom_target(ceph-dencoder-modules)
+add_dependencies(ceph-dencoder ceph-dencoder-modules)
 
 function(add_denc_mod name)
   add_library(${name} SHARED
@@ -49,12 +50,16 @@ add_denc_mod(denc-mod-osd
 target_link_libraries(denc-mod-osd
   os
   osd
-  mon)
+  mon
+  erasure_code
+  global)
 
 if(WITH_RADOSGW)
   add_denc_mod(denc-mod-rgw
     rgw_types.cc
     ${CMAKE_SOURCE_DIR}/src/rgw/rgw_dencoder.cc)
+  target_include_directories(denc-mod-rgw
+    SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
   target_link_libraries(denc-mod-rgw
     rgw_a
     cls_rgw_client
@@ -82,6 +87,16 @@ if(WITH_RBD)
       krbd)
   endif()
 endif()
+
+if(WITH_NVMEOF_GATEWAY_MONITOR_CLIENT)
+  add_denc_mod(denc-mod-nvmeof
+    nvmeof_types.cc)
+  target_link_libraries(denc-mod-nvmeof
+    mon
+    ceph-common
+    )
+endif()
+
 
 if(WITH_CEPHFS)
   add_denc_mod(denc-mod-cephfs

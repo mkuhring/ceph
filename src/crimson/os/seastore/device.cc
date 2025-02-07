@@ -4,13 +4,15 @@
 #include "device.h"
 
 #include "segment_manager.h"
+#include "random_block_manager.h"
+#include "random_block_manager/rbm_device.h"
 
 namespace crimson::os::seastore {
 
 std::ostream& operator<<(std::ostream& out, const device_spec_t& ds)
 {
   return out << "device_spec("
-             << "magic=" << ds.magic
+             << "magic=0x" << std::hex << ds.magic << std::dec
              << ", dtype=" << ds.dtype
              << ", " << device_id_printer_t{ds.id}
              << ")";
@@ -31,10 +33,16 @@ std::ostream& operator<<(std::ostream& out, const device_config_t& conf)
 }
 
 seastar::future<DeviceRef>
-Device::make_device(const std::string& device)
+Device::make_device(const std::string& device, device_type_t dtype)
 {
-  // TODO: configure device type
-  return SegmentManager::get_segment_manager(device
+  if (get_default_backend_of_device(dtype) == backend_type_t::SEGMENTED) {
+    return SegmentManager::get_segment_manager(device, dtype
+    ).then([](DeviceRef ret) {
+      return ret;
+    });
+  } 
+  assert(get_default_backend_of_device(dtype) == backend_type_t::RANDOM_BLOCK);
+  return get_rb_device(device
   ).then([](DeviceRef ret) {
     return ret;
   });

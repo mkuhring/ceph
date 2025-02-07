@@ -44,7 +44,7 @@ template <typename I>
 inline bool is_copy_on_read(I *ictx, const IOContext& io_context) {
   std::shared_lock image_locker{ictx->image_lock};
   return (ictx->clone_copy_on_read && !ictx->read_only &&
-          io_context->read_snap().value_or(CEPH_NOSNAP) == CEPH_NOSNAP &&
+          io_context->get_read_snap() == CEPH_NOSNAP &&
           (ictx->exclusive_lock == nullptr ||
            ictx->exclusive_lock->is_lock_owner()));
 }
@@ -145,15 +145,17 @@ void ObjectRequest<I>::add_write_hint(I& image_ctx, neorados::WriteOp* wr) {
 
 template <typename I>
 bool ObjectRequest<I>::compute_parent_extents(Extents *parent_extents,
+                                              ImageArea *area,
                                               bool read_request) {
   ceph_assert(ceph_mutex_is_locked(m_ictx->image_lock));
 
   m_has_parent = false;
   parent_extents->clear();
+  *area = ImageArea::DATA;
 
-  uint64_t parent_overlap;
+  uint64_t raw_overlap;
   int r = m_ictx->get_parent_overlap(
-    m_io_context->read_snap().value_or(CEPH_NOSNAP), &parent_overlap);
+      m_io_context->get_read_snap(), &raw_overlap);
   if (r < 0) {
     // NOTE: it's possible for a snapshot to be deleted while we are
     // still reading from it
@@ -161,23 +163,20 @@ bool ObjectRequest<I>::compute_parent_extents(Extents *parent_extents,
                        << cpp_strerror(r) << dendl;
     return false;
   }
-
-  if (!read_request && !m_ictx->migration_info.empty()) {
-    parent_overlap = m_ictx->migration_info.overlap;
+  bool migration_write = !read_request && !m_ictx->migration_info.empty();
+  if (migration_write) {
+    raw_overlap = m_ictx->migration_info.overlap;
   }
-
-  if (parent_overlap == 0) {
+  if (raw_overlap == 0) {
     return false;
   }
 
-  io::util::extent_to_file(m_ictx, m_object_no, 0, m_ictx->layout.object_size,
-                           *parent_extents);
-  uint64_t object_overlap = m_ictx->prune_parent_extents(*parent_extents,
-                                                         parent_overlap);
+  std::tie(*parent_extents, *area) = io::util::object_to_area_extents(
+      m_ictx, m_object_no, {{0, m_ictx->layout.object_size}});
+  uint64_t object_overlap = m_ictx->prune_parent_extents(
+      *parent_extents, *area, raw_overlap, migration_write);
   if (object_overlap > 0) {
-    ldout(m_ictx->cct, 20) << "overlap " << parent_overlap << " "
-                           << "extents " << *parent_extents << dendl;
-    m_has_parent = !parent_extents->empty();
+    m_has_parent = true;
     return true;
   }
   return false;
@@ -223,7 +222,7 @@ void ObjectReadRequest<I>::read_object() {
   I *image_ctx = this->m_ictx;
 
   std::shared_lock image_locker{image_ctx->image_lock};
-  auto read_snap_id = this->m_io_context->read_snap().value_or(CEPH_NOSNAP);
+  auto read_snap_id = this->m_io_context->get_read_snap();
   if (read_snap_id == image_ctx->snap_id &&
       image_ctx->object_map != nullptr &&
       !image_ctx->object_map->object_may_exist(this->m_object_no)) {
@@ -290,7 +289,7 @@ void ObjectReadRequest<I>::read_parent() {
 
   io::util::read_parent<I>(
     image_ctx, this->m_object_no, this->m_extents,
-    this->m_io_context->read_snap().value_or(CEPH_NOSNAP), this->m_trace,
+    this->m_io_context->get_read_snap(), this->m_trace,
     ctx);
 }
 
@@ -323,7 +322,8 @@ void ObjectReadRequest<I>::copyup() {
   image_ctx->owner_lock.lock_shared();
   image_ctx->image_lock.lock_shared();
   Extents parent_extents;
-  if (!this->compute_parent_extents(&parent_extents, true) ||
+  ImageArea area;
+  if (!this->compute_parent_extents(&parent_extents, &area, true) ||
       (image_ctx->exclusive_lock != nullptr &&
        !image_ctx->exclusive_lock->is_lock_owner())) {
     image_ctx->image_lock.unlock_shared();
@@ -339,7 +339,8 @@ void ObjectReadRequest<I>::copyup() {
   if (it == image_ctx->copyup_list.end()) {
     // create and kick off a CopyupRequest
     auto new_req = CopyupRequest<I>::create(
-      image_ctx, this->m_object_no, std::move(parent_extents), this->m_trace);
+        image_ctx, this->m_object_no, std::move(parent_extents), area,
+        this->m_trace);
 
     image_ctx->copyup_list[this->m_object_no] = new_req;
     image_ctx->copyup_list_lock.unlock();
@@ -384,11 +385,11 @@ void AbstractObjectWriteRequest<I>::compute_parent_info() {
   I *image_ctx = this->m_ictx;
   std::shared_lock image_locker{image_ctx->image_lock};
 
-  this->compute_parent_extents(&m_parent_extents, false);
+  this->compute_parent_extents(&m_parent_extents, &m_image_area, false);
 
   if (!this->has_parent() ||
       (m_full_object &&
-       !this->m_io_context->write_snap_context() &&
+       !this->m_io_context->get_write_snap_context() &&
        !is_post_copyup_write_required())) {
     m_copyup_enabled = false;
   }
@@ -490,8 +491,8 @@ void AbstractObjectWriteRequest<I>::write_object() {
   neorados::WriteOp write_op;
   if (m_copyup_enabled) {
     if (m_guarding_migration_write) {
-      auto snap_seq = (this->m_io_context->write_snap_context() ?
-          this->m_io_context->write_snap_context()->first : 0);
+      auto snap_seq = (this->m_io_context->get_write_snap_context() ?
+          this->m_io_context->get_write_snap_context()->first : 0);
       ldout(image_ctx->cct, 20) << "guarding write: snap_seq=" << snap_seq
                                 << dendl;
 
@@ -565,8 +566,8 @@ void AbstractObjectWriteRequest<I>::copyup() {
   auto it = image_ctx->copyup_list.find(this->m_object_no);
   if (it == image_ctx->copyup_list.end()) {
     auto new_req = CopyupRequest<I>::create(
-      image_ctx, this->m_object_no, std::move(this->m_parent_extents),
-      this->m_trace);
+        image_ctx, this->m_object_no, std::move(this->m_parent_extents),
+        m_image_area, this->m_trace);
     this->m_parent_extents.clear();
 
     // make sure to wait on this CopyupRequest
@@ -697,7 +698,7 @@ void ObjectWriteSameRequest<I>::add_write_ops(neorados::WriteOp* wr) {
 
 template <typename I>
 void ObjectCompareAndWriteRequest<I>::add_write_ops(neorados::WriteOp* wr) {
-  wr->cmpext(this->m_object_off, bufferlist{m_cmp_bl}, nullptr);
+  wr->cmpext(this->m_object_off, bufferlist{m_cmp_bl}, &m_mismatch_object_offset);
 
   if (this->m_full_object) {
     wr->write_full(bufferlist{m_write_bl});
@@ -709,14 +710,14 @@ void ObjectCompareAndWriteRequest<I>::add_write_ops(neorados::WriteOp* wr) {
 
 template <typename I>
 int ObjectCompareAndWriteRequest<I>::filter_write_result(int r) const {
-  if (r <= -MAX_ERRNO) {
+  // Error code value for cmpext mismatch. Works for both neorados and
+  // mock image, which seems to be short-circuiting on nonexistence.
+  if (r == -MAX_ERRNO) {
     I *image_ctx = this->m_ictx;
-    Extents image_extents;
 
     // object extent compare mismatch
-    uint64_t offset = -MAX_ERRNO - r;
-    io::util::extent_to_file(image_ctx, this->m_object_no, offset,
-                             this->m_object_len, image_extents);
+    auto [image_extents, _] = io::util::object_to_area_extents(
+        image_ctx, this->m_object_no, {{m_mismatch_object_offset, this->m_object_len}});
     ceph_assert(image_extents.size() == 1);
 
     if (m_mismatch_offset) {
@@ -738,7 +739,7 @@ ObjectListSnapsRequest<I>::ObjectListSnapsRequest(
     m_object_extents(std::move(object_extents)),
     m_snap_ids(std::move(snap_ids)), m_list_snaps_flags(list_snaps_flags),
     m_snapshot_delta(snapshot_delta) {
-  this->m_io_context->read_snap(CEPH_SNAPDIR);
+  this->m_io_context->set_read_snap(CEPH_SNAPDIR);
 }
 
 template <typename I>
@@ -834,16 +835,17 @@ void ObjectListSnapsRequest<I>::handle_list_snaps(int r) {
                        end_snap_id, &diff, &end_size, &exists,
                        &clone_end_snap_id, &read_whole_object);
 
-    if (read_whole_object ||
-        (!diff.empty() &&
-         ((m_list_snaps_flags & LIST_SNAPS_FLAG_WHOLE_OBJECT) != 0))) {
+    if (read_whole_object) {
       ldout(cct, 1) << "need to read full object" << dendl;
-      diff.clear();
       diff.insert(0, image_ctx->layout.object_size);
+      exists = true;
       end_size = image_ctx->layout.object_size;
       clone_end_snap_id = end_snap_id;
-    } else if (!exists) {
-      end_size = 0;
+    } else if ((m_list_snaps_flags & LIST_SNAPS_FLAG_WHOLE_OBJECT) != 0 &&
+               !diff.empty()) {
+      ldout(cct, 20) << "expanding diff from " << diff << dendl;
+      diff.clear();
+      diff.insert(0, image_ctx->layout.object_size);
     }
 
     if (exists) {
@@ -863,7 +865,8 @@ void ObjectListSnapsRequest<I>::handle_list_snaps(int r) {
 
     // clip diff to size of object (in case it was truncated)
     interval_set<uint64_t> zero_interval;
-    if (end_size < prev_end_size) {
+    if (end_size < prev_end_size &&
+        (m_list_snaps_flags & LIST_SNAPS_FLAG_WHOLE_OBJECT) == 0) {
       zero_interval.insert(end_size, prev_end_size - end_size);
       zero_interval.intersection_of(object_interval);
 
@@ -884,7 +887,7 @@ void ObjectListSnapsRequest<I>::handle_list_snaps(int r) {
                    << "end_size=" << end_size << ", "
                    << "prev_end_size=" << prev_end_size << ", "
                    << "exists=" << exists << ", "
-                   << "whole_object=" << read_whole_object << dendl;
+                   << "read_whole_object=" << read_whole_object << dendl;
 
     // check if object exists prior to start of incremental snap delta so that
     // we don't DNE the object if no additional deltas exist
@@ -955,21 +958,17 @@ void ObjectListSnapsRequest<I>::list_from_parent() {
     return;
   }
 
-  // calculate reverse mapping onto the parent image
-  Extents parent_image_extents;
-  for (auto [object_off, object_len]: m_object_extents) {
-    io::util::extent_to_file(image_ctx, this->m_object_no, object_off,
-                             object_len, parent_image_extents);
-  }
-
-  uint64_t parent_overlap = 0;
+  Extents parent_extents;
+  uint64_t raw_overlap = 0;
   uint64_t object_overlap = 0;
-  int r = image_ctx->get_parent_overlap(snap_id_end, &parent_overlap);
-  if (r == 0) {
-    object_overlap = image_ctx->prune_parent_extents(parent_image_extents,
-                                                     parent_overlap);
+  image_ctx->get_parent_overlap(snap_id_end, &raw_overlap);
+  if (raw_overlap > 0) {
+    // calculate reverse mapping onto the parent image
+    std::tie(parent_extents, m_image_area) = io::util::object_to_area_extents(
+        image_ctx, this->m_object_no, m_object_extents);
+    object_overlap = image_ctx->prune_parent_extents(
+        parent_extents, m_image_area, raw_overlap, false);
   }
-
   if (object_overlap == 0) {
     image_locker.unlock();
 
@@ -982,14 +981,15 @@ void ObjectListSnapsRequest<I>::list_from_parent() {
     &ObjectListSnapsRequest<I>::handle_list_from_parent>(this);
   auto aio_comp = AioCompletion::create_and_start(
     ctx, librbd::util::get_image_ctx(image_ctx->parent), AIO_TYPE_GENERIC);
-  ldout(cct, 20) << "aio_comp=" << aio_comp<< ", "
-                 << "parent_image_extents " << parent_image_extents << dendl;
+  ldout(cct, 20) << "completion=" << aio_comp
+                 << " parent_extents=" << parent_extents
+                 << " area=" << m_image_area << dendl;
 
    auto list_snaps_flags = (
      m_list_snaps_flags | LIST_SNAPS_FLAG_IGNORE_ZEROED_EXTENTS);
 
   ImageListSnapsRequest<I> req(
-    *image_ctx->parent, aio_comp, std::move(parent_image_extents),
+    *image_ctx->parent, aio_comp, std::move(parent_extents), m_image_area,
     {0, image_ctx->parent->snap_id}, list_snaps_flags, &m_parent_snapshot_delta,
     this->m_trace);
   req.send();
@@ -1011,7 +1011,7 @@ void ObjectListSnapsRequest<I>::handle_list_from_parent(int r) {
   }
 
   // the write/read snapshot id key is not useful for parent images so
-  // map the the special-case INITIAL_WRITE_READ_SNAP_IDS key
+  // map the special-case INITIAL_WRITE_READ_SNAP_IDS key
   *m_snapshot_delta = {};
   auto& intervals = (*m_snapshot_delta)[INITIAL_WRITE_READ_SNAP_IDS];
   for (auto& [key, image_extents] : m_parent_snapshot_delta) {
@@ -1020,8 +1020,9 @@ void ObjectListSnapsRequest<I>::handle_list_from_parent(int r) {
 
       // map image-extents back to this object
       striper::LightweightObjectExtents object_extents;
-      io::util::file_to_extents(image_ctx, image_extent.get_off(),
-                                image_extent.get_len(), 0, &object_extents);
+      io::util::area_to_object_extents(image_ctx, image_extent.get_off(),
+                                       image_extent.get_len(), m_image_area, 0,
+                                       &object_extents);
       for (auto& object_extent : object_extents) {
         ceph_assert(object_extent.object_no == this->m_object_no);
         intervals.insert(

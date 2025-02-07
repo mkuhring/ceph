@@ -74,6 +74,33 @@ example spec file:
     spec:
       rgw_frontend_port: 8080
 
+Passing Frontend Extra Arguments
+--------------------------------
+
+The RGW service specification can be used to pass extra arguments to the rgw frontend by using
+the `rgw_frontend_extra_args` arguments list.
+
+example spec file:
+
+.. code-block:: yaml
+
+    service_type: rgw
+    service_id: foo
+    placement:
+      label: rgw
+      count_per_host: 2
+    spec:
+      rgw_realm: myrealm
+      rgw_zone: myzone
+      rgw_frontend_type: "beast"
+      rgw_frontend_port: 5000
+      rgw_frontend_extra_args:
+      - "tcp_nodelay=1"
+      - "max_header_size=65536"
+
+.. note:: cephadm combines the arguments from the `spec` section and the ones from
+	  the `rgw_frontend_extra_args` into a single space-separated arguments list
+	  which is used to set the value of `rgw_frontends` configuration parameter.
 
 Multisite zones
 ---------------
@@ -83,23 +110,23 @@ To deploy RGWs serving the multisite *myorg* realm and the *us-east-1* zone on
 
 .. prompt:: bash #
 
-   ceph orch apply rgw east --realm=myorg --zone=us-east-1 --placement="2 myhost1 myhost2"
+   ceph orch apply rgw east --realm=myorg --zonegroup=us-east-zg-1 --zone=us-east-1 --placement="2 myhost1 myhost2"
 
 Note that in a multisite situation, cephadm only deploys the daemons.  It does not create
-or update the realm or zone configurations.  To create a new realm and zone, you need to do
-something like:
+or update the realm or zone configurations.  To create a new realms, zones and zonegroups
+you can use :ref:`mgr-rgw-module` or manually using something like:
 
 .. prompt:: bash #
 
-  radosgw-admin realm create --rgw-realm=<realm-name> --default
-  
-.. prompt:: bash #
-
-  radosgw-admin zonegroup create --rgw-zonegroup=<zonegroup-name>  --master --default
+  radosgw-admin realm create --rgw-realm=<realm-name>
 
 .. prompt:: bash #
 
-  radosgw-admin zone create --rgw-zonegroup=<zonegroup-name> --rgw-zone=<zone-name> --master --default
+  radosgw-admin zonegroup create --rgw-zonegroup=<zonegroup-name>  --master
+
+.. prompt:: bash #
+
+  radosgw-admin zone create --rgw-zonegroup=<zonegroup-name> --rgw-zone=<zone-name> --master
 
 .. prompt:: bash #
 
@@ -146,6 +173,32 @@ Then apply this yaml document:
 Note the value of ``rgw_frontend_ssl_certificate`` is a literal string as
 indicated by a ``|`` character preserving newline characters.
 
+Disabling multisite sync traffic
+--------------------------------
+
+There is an RGW config option called ``rgw_run_sync_thread`` that tells the
+RGW daemon to not transmit multisite replication data. This is useful if you want
+that RGW daemon to be dedicated to I/O rather than multisite sync operations.
+The RGW spec file includes a setting ``disable_multisite_sync_traffic`` that when
+set to "True" will tell cephadm to set ``rgw_run_sync_thread`` to false for all
+RGW daemons deployed for that RGW service. For example
+
+.. code-block:: yaml
+
+    service_type: rgw
+    service_id: foo
+    placement:
+      label: rgw
+    spec:
+      rgw_realm: myrealm
+      rgw_zone: myzone
+      rgw_zonegroup: myzg
+      disable_multisite_sync_traffic: True
+
+.. note:: This will only stop the RGW daemon(s) from sending replication data.
+    The daemon can still receive replication data unless it has been removed
+    from the zonegroup and zone replication endpoints.
+
 Service specification
 ---------------------
 
@@ -164,8 +217,10 @@ for RGW with a minimum set of configuration options.  The orchestrator will
 deploy and manage a combination of haproxy and keepalived to provide load
 balancing on a floating virtual IP.
 
-If SSL is used, then SSL must be configured and terminated by the ingress service
-and not RGW itself.
+If the RGW service is configured with SSL enabled, then the ingress service
+will use the `ssl` and `verify none` options in the backend configuration.
+Trust verification is disabled because the backends are accessed by IP 
+address instead of FQDN.
 
 .. image:: ../../images/HAProxy_for_RGW.svg
 
@@ -186,8 +241,7 @@ between all the RGW daemons available.
 Prerequisites
 -------------
 
-* An existing RGW service, without SSL.  (If you want SSL service, the certificate
-  should be configured on the ingress service, not the RGW service.)
+* An existing RGW service.
 
 Deploying
 ---------
@@ -211,12 +265,15 @@ It is a yaml format file with the following properties:
         - host2
         - host3
     spec:
-      backend_service: rgw.something      # adjust to match your existing RGW service
-      virtual_ip: <string>/<string>       # ex: 192.168.20.1/24
-      frontend_port: <integer>            # ex: 8080
-      monitor_port: <integer>             # ex: 1967, used by haproxy for load balancer status
-      virtual_interface_networks: [ ... ] # optional: list of CIDR networks
-      ssl_cert: |                         # optional: SSL certificate and key
+      backend_service: rgw.something            # adjust to match your existing RGW service
+      virtual_ip: <string>/<string>             # ex: 192.168.20.1/24
+      frontend_port: <integer>                  # ex: 8080
+      monitor_port: <integer>                   # ex: 1967, used by haproxy for load balancer status
+      virtual_interface_networks: [ ... ]       # optional: list of CIDR networks
+      use_keepalived_multicast: <bool>          # optional: Default is False.
+      vrrp_interface_network: <string>/<string> # optional: ex: 192.168.20.0/24
+      health_check_interval: <string>           # optional: Default is 2s.
+      ssl_cert: |                               # optional: SSL certificate and key
         -----BEGIN CERTIFICATE-----
         ...
         -----END CERTIFICATE-----
@@ -242,6 +299,8 @@ It is a yaml format file with the following properties:
       frontend_port: <integer>            # ex: 8080
       monitor_port: <integer>             # ex: 1967, used by haproxy for load balancer status
       virtual_interface_networks: [ ... ] # optional: list of CIDR networks
+      first_virtual_router_id: <integer>  # optional: default 50
+      health_check_interval: <string>     # optional: Default is 2s.
       ssl_cert: |                         # optional: SSL certificate and key
         -----BEGIN CERTIFICATE-----
         ...
@@ -275,6 +334,24 @@ where the properties of this service specification are:
 * ``ssl_cert``:
     SSL certificate, if SSL is to be enabled. This must contain the both the certificate and
     private key blocks in .pem format.
+* ``use_keepalived_multicast``
+    Default is False. By default, cephadm will deploy keepalived config to use unicast IPs,
+    using the IPs of the hosts. The IPs chosen will be the same IPs cephadm uses to connect
+    to the machines. But if multicast is prefered, we can set ``use_keepalived_multicast``
+    to ``True`` and Keepalived will use multicast IP (224.0.0.18) to communicate between instances,
+    using the same interfaces as where the VIPs are.
+* ``vrrp_interface_network``
+    By default, cephadm will configure keepalived to use the same interface where the VIPs are
+    for VRRP communication. If another interface is needed, it can be set via ``vrrp_interface_network``
+    with a network to identify which ethernet interface to use.
+* ``first_virtual_router_id``
+    Default is 50. When deploying more than 1 ingress, this parameter can be used to ensure each
+    keepalived will have different virtual_router_id. In the case of using ``virtual_ips_list``,
+    each IP will create its own virtual router. So the first one will have ``first_virtual_router_id``,
+    second one will have ``first_virtual_router_id`` + 1, etc. Valid values go from 1 to 255.
+* ``health_check_interval``
+    Default is 2 seconds. This parameter can be used to set the interval between health checks
+    for the haproxy with the backend servers.
 
 .. _ingress-virtual-ip:
 

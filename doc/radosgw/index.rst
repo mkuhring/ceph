@@ -5,8 +5,8 @@
 =====================
 
 :term:`Ceph Object Gateway` is an object storage interface built on top of
-``librados`` to provide applications with a RESTful gateway to
-Ceph Storage Clusters. :term:`Ceph Object Storage` supports two interfaces:
+``librados``. It provides a RESTful gateway between applications and Ceph
+Storage Clusters. :term:`Ceph Object Storage` supports two interfaces:
 
 #. **S3-compatible:** Provides object storage functionality with an interface
    that is compatible with a large subset of the Amazon S3 RESTful API.
@@ -14,13 +14,14 @@ Ceph Storage Clusters. :term:`Ceph Object Storage` supports two interfaces:
 #. **Swift-compatible:** Provides object storage functionality with an interface
    that is compatible with a large subset of the OpenStack Swift API.
 
-Ceph Object Storage uses the Ceph Object Gateway daemon (``radosgw``), which is
-an HTTP server for interacting with a Ceph Storage Cluster. Since it
-provides interfaces compatible with OpenStack Swift and Amazon S3, the Ceph
-Object Gateway has its own user management. Ceph Object Gateway can store data
-in the same Ceph Storage Cluster used to store data from Ceph File System clients
-or Ceph Block Device clients. The S3 and Swift APIs share a common namespace, so
-you may write data with one API and retrieve it with the other.
+Ceph Object Storage uses the Ceph Object Gateway daemon (``radosgw``), an HTTP
+server designed to interact with a Ceph Storage Cluster. The Ceph Object
+Gateway provides interfaces that are compatible with both Amazon S3 and
+OpenStack Swift, and it has its own user management. Ceph Object Gateway can
+use a single Ceph Storage cluster to store data from Ceph File System and from
+Ceph Block device clients. The S3 API and the Swift API share a common
+namespace, which means that it is possible to write data to a Ceph Storage
+Cluster with one API and then retrieve that data with the other API.
 
 .. ditaa::
 
@@ -41,13 +42,16 @@ you may write data with one API and retrieve it with the other.
    :maxdepth: 1
 
    HTTP Frontends <frontends>
-   Pool Placement and Storage Classes <placement>
    Multisite Configuration <multisite>
+   Zone Features <zone-features>
+   Pool Placement and Storage Classes <placement>
    Multisite Sync Policy Configuration <multisite-sync-policy>
    Configuring Pools <pools>
    Config Reference <config-ref>
    Admin Guide <admin>
+   User Accounts <account>
    S3 API <s3>
+   IAM API <iam>
    Data caching and CDN <rgw-cache.rst>
    Swift API <swift>
    Admin Ops API <adminops>
@@ -83,4 +87,7 @@ you may write data with one API and retrieve it with the other.
    Lua Scripting <lua-scripting>
    D3N Data Cache <d3n_datacache>
    Cloud Transition <cloud-transition>
+   Metrics <metrics>
+   UADK Acceleration for Compression <uadk-accel>
+   Bucket Logging <bucket_logging>
 

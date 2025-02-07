@@ -17,6 +17,7 @@
 #include "mds/MDSRank.h"
 #include "mds/MDCache.h"
 #include "mds/MDSContinuation.h"
+#include "osdc/Objecter.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -67,13 +68,24 @@ int ScrubStack::_enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top)
       dout(10) << __func__ << " with {" << *in << "}" << ", already in scrubbing" << dendl;
       return -CEPHFS_EBUSY;
     }
+    if(in->state_test(CInode::STATE_PURGING)) {
+      dout(10) << *obj << " is purging, skip pushing into scrub stack" << dendl;
+      // treating this as success since purge will make sure this inode goes away
+      return 0;
+    }
 
     dout(10) << __func__ << " with {" << *in << "}" << ", top=" << top << dendl;
     in->scrub_initialize(header);
+    in->uninline_initialize();
   } else if (CDir *dir = dynamic_cast<CDir*>(obj)) {
     if (dir->scrub_is_in_progress()) {
       dout(10) << __func__ << " with {" << *dir << "}" << ", already in scrubbing" << dendl;
       return -CEPHFS_EBUSY;
+    }
+    if(dir->get_inode()->state_test(CInode::STATE_PURGING)) {
+      dout(10) << *obj << " is purging, skip pushing into scrub stack" << dendl;
+      // treating this as success since purge will make sure this dir inode goes away
+      return 0;
     }
 
     dout(10) << __func__ << " with {" << *dir << "}" << ", top=" << top << dendl;
@@ -96,6 +108,55 @@ int ScrubStack::_enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top)
   return 0;
 }
 
+void ScrubStack::purge_scrub_counters(std::string_view tag)
+{
+  for (auto& stat : mds_scrub_stats) {
+    if (tag == "all") {
+      stat.counters.clear();
+    } else {
+      auto it = stat.counters.find(std::string(tag));
+      if (it != stat.counters.end()) {
+	stat.counters.erase(it);
+      }
+    }
+  }
+}
+
+// called from tick
+void ScrubStack::purge_old_scrub_counters()
+{
+  // "mds_scrub_stats_review_period" must be in number of days
+  auto review_period = ceph::make_timespan(_mds_scrub_stats_review_period * 24 * 60 * 60);
+  auto now = coarse_real_clock::now();
+
+  dout(20) << __func__ << " review_period:" << review_period << dendl;
+
+  for (mds_rank_t rank = 0; rank < (mds_rank_t)mds_scrub_stats.size(); rank++) {
+    auto& counters = mds_scrub_stats[rank].counters;
+    for (auto it = counters.begin(); it != counters.end(); ) {
+      auto curr = it;
+      auto c = (*it).second;
+      auto elapsed = now - c.start_time;
+      dout(20) << __func__
+	       << " rank(" << rank << ") :"
+               << " elapsed:" << elapsed
+	       << dendl;
+      ++it;
+      if (elapsed >= review_period) {
+	counters.erase(curr);
+      }
+    }
+  }
+}
+
+void ScrubStack::init_scrub_counters(std::string_view path, std::string_view tag)
+{
+  scrub_counters_t sc{coarse_real_clock::now(), std::string(path), 0, 0, 0};
+  for (auto& stat : mds_scrub_stats) {
+    stat.counters[std::string(tag)] = sc;
+  }
+}
+
 int ScrubStack::enqueue(CInode *in, ScrubHeaderRef& header, bool top)
 {
   // abort in progress
@@ -109,7 +170,24 @@ int ScrubStack::enqueue(CInode *in, ScrubHeaderRef& header, bool top)
 	     << ", conflicting tag " << header->get_tag() << dendl;
     return -CEPHFS_EEXIST;
   }
+  if (header->get_scrub_mdsdir()) {
+    filepath fp;
+    mds_rank_t rank;
+    rank = mdcache->mds->get_nodeid();
+    if(rank >= 0 && rank < MAX_MDS) {
+      fp.set_path("", MDS_INO_MDSDIR(rank));
+    }
+    int r = _enqueue(mdcache->get_inode(fp.get_ino()), header, true);
+    if (r < 0) {
+      return r;
+    }
+    //to make sure mdsdir is always on the top
+    top = false;
+  }
 
+  std::string path;
+  in->make_path_string(path);
+  init_scrub_counters(path, header->get_tag());
   int r = _enqueue(in, header, top);
   if (r < 0)
     return r;
@@ -204,6 +282,7 @@ void ScrubStack::kick_off_scrubs()
 	// it's a regular file, symlink, or hard link
 	dequeue(in); // we only touch it this once, so remove from stack
 
+	uninline_data(in, new C_MDSInternalNoop);
 	scrub_file_inode(in);
       } else {
 	bool added_children = false;
@@ -212,6 +291,7 @@ void ScrubStack::kick_off_scrubs()
 	if (done) {
 	  dout(20) << __func__ << " dir inode, done" << dendl;
 	  dequeue(in);
+	  in->uninline_finished();
 	}
 	if (added_children) {
 	  // dirfrags were queued at top of stack
@@ -297,12 +377,20 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
 
   frag_vec_t frags;
   in->dirfragtree.get_leaves(frags);
-  dout(20) << __func__ << "recursive mode, frags " << frags << dendl;
+  dout(20) << __func__ << " recursive mode, frags " << frags << dendl;
   for (auto &fg : frags) {
     if (queued.contains(fg))
       continue;
     CDir *dir = in->get_or_open_dirfrag(mdcache, fg);
-    if (!dir->is_auth()) {
+    if (mds->damage_table.is_dirfrag_damaged(dir)) {
+      /* N.B.: we are cowardly (and ironically) not looking at dirfrags we've
+       * noted as damaged already. The state of the dirfrag will be missing an
+       * omap (or object) or the fnode is corrupt. Neither situation the MDS
+       * presently knows how to recover from. So skip it for now.
+       */
+      dout(5) << __func__ << ": not scrubbing damaged dirfrag: " << *dir << dendl;
+      continue;
+    } else if (!dir->is_auth()) {
       if (dir->is_ambiguous_auth()) {
 	dout(20) << __func__ << " ambiguous auth " << *dir  << dendl;
 	dir->add_waiter(MDSCacheObject::WAIT_SINGLEAUTH, gather.new_sub());
@@ -343,7 +431,6 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
     scrub_r.tag = header->get_tag();
 
     for (auto& p : scrub_remote) {
-      p.second.simplify();
       dout(20) << __func__ << " forward " << p.second  << " to mds." << p.first << dendl;
       auto r = make_message<MMDSScrub>(MMDSScrub::OP_QUEUEDIR, in->ino(),
 				       std::move(p.second), header->get_tag(),
@@ -407,15 +494,28 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *done)
   ScrubHeaderRef header = dir->get_scrub_header();
   version_t last_scrub = dir->scrub_info()->last_recursive.version;
   if (header->get_recursive()) {
-    for (auto it = dir->begin(); it != dir->end(); ++it) {
-      if (it->first.snapid != CEPH_NOSNAP)
+    auto next_seq = mdcache->get_global_snaprealm()->get_newest_seq()+1;
+    for (auto it = dir->begin(); it != dir->end(); /* nop */) {
+      auto [dnk, dn] = *it;
+      ++it; /* trim (in the future) may remove dentry */
+
+      if (dn->scrub(next_seq)) {
+        std::string path;
+        dir->get_inode()->make_path_string(path, true);
+        clog->warn() << "Scrub error on dentry " << *dn
+                     << " see " << g_conf()->name
+                     << " log and `damage ls` output for details";
+      }
+
+      if (dnk.snapid != CEPH_NOSNAP) {
 	continue;
-      CDentry *dn = it->second;
+      }
+
       CDentry::linkage_t *dnl = dn->get_linkage();
       if (dn->get_version() <= last_scrub &&
 	  dnl->get_remote_d_type() != DT_DIR &&
 	  !header->get_force()) {
-	dout(15) << __func__ << " skip dentry " << it->first
+	dout(15) << __func__ << " skip dentry " << dnk
 		 << ", no change since last scrub" << dendl;
 	continue;
       }
@@ -427,8 +527,15 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *done)
     }
   }
 
-  dir->scrub_local();
+  if (!dir->scrub_local()) {
+    std::string path;
+    dir->get_inode()->make_path_string(path, true);
+    clog->warn() << "Scrub error on dir " << dir->ino()
+                 << " (" << path << ") see " << g_conf()->name
+                 << " log and `damage ls` output for details";
+  }
 
+  mdcache->maybe_fragment(dir);
   dir->scrub_finished();
   dir->auth_unpin(this);
 
@@ -654,11 +761,54 @@ void ScrubStack::scrub_status(Formatter *f) {
       }
       *optcss << "force";
     }
+    if (header->get_scrub_mdsdir()) {
+      if (have_more) {
+        *optcss << ",";
+      }
+      *optcss << "scrub_mdsdir";
+    }
 
     f->dump_string("options", optcss->strv());
     f->close_section(); // scrub id
   }
   f->close_section(); // scrubs
+
+  if (mds_scrub_stats.size()) {
+    f->open_object_section("scrub_stats");
+    for (auto& [tag, ctrs] : mds_scrub_stats[0].counters) {
+      uint64_t started = 0;
+      uint64_t passed = 0;
+      uint64_t failed = 0;
+      uint64_t skipped = 0;
+      for (auto& stats : mds_scrub_stats) {
+	if (auto it = stats.counters.find(tag); it != stats.counters.end()) {
+	  auto& [t, c] = *it;
+	  started += c.uninline_started;
+	  passed += c.uninline_passed;
+	  failed += c.uninline_failed;
+	  skipped += c.uninline_skipped;
+	}
+      }
+      f->open_object_section(tag);
+      {
+	f->dump_stream("start_time") << ctrs.start_time;
+	std::string path = ctrs.origin_path;
+	if (path == "") {
+	  path = "/";
+	} else if (path.starts_with("~mds")) {
+	  path = "~mdsdir";
+	}
+	f->dump_string("path", path);
+	f->dump_int("uninline_started", started);
+	f->dump_int("uninline_passed", passed);
+	f->dump_int("uninline_failed", failed);
+	f->dump_int("uninline_skipped", skipped);
+      }
+      f->close_section(); // tag
+    }
+    f->close_section(); // scrub_stats
+  }
+
   f->close_section(); // result
 }
 
@@ -818,6 +968,18 @@ void ScrubStack::dispatch(const cref_t<Message> &m)
   }
 }
 
+bool ScrubStack::remove_inode_if_stacked(CInode *in) {
+  MDSCacheObject *obj = dynamic_cast<MDSCacheObject*>(in);
+  if(obj->item_scrub.is_on_list()) {
+    dout(20) << "removing inode " << *in << " from scrub_stack" << dendl;
+    obj->put(MDSCacheObject::PIN_SCRUBQUEUE);
+    obj->item_scrub.remove_myself();
+    stack_size--;
+    return true;
+  }
+  return false;
+}
+
 void ScrubStack::handle_scrub(const cref_t<MMDSScrub> &m)
 {
 
@@ -832,22 +994,30 @@ void ScrubStack::handle_scrub(const cref_t<MMDSScrub> &m)
 
       std::vector<CDir*> dfs;
       MDSGatherBuilder gather(g_ceph_context);
+      frag_vec_t frags;
+      diri->dirfragtree.get_leaves(frags);
       for (const auto& fg : m->get_frags()) {
-	CDir *dir = diri->get_dirfrag(fg);
-	if (!dir) {
-	  dout(10) << __func__ << " no frag " << fg << dendl;
-	  continue;
+	for (auto f : frags) {
+	  if (!fg.contains(f)) {
+	    dout(20) << __func__ << " skipping " << f << dendl;
+	    continue;
+	  }
+	  CDir *dir = diri->get_or_open_dirfrag(mdcache, f);
+	  if (!dir) {
+	    dout(10) << __func__ << " no frag " << f << dendl;
+	    continue;
+	  }
+	  if (!dir->is_auth()) {
+	    dout(10) << __func__ << " not auth " << *dir << dendl;
+	    continue;
+	  }
+	  if (!dir->can_auth_pin()) {
+	    dout(10) << __func__ << " can't auth pin " << *dir <<  dendl;
+	    dir->add_waiter(CDir::WAIT_UNFREEZE, gather.new_sub());
+	    continue;
+	  }
+	  dfs.push_back(dir);
 	}
-	if (!dir->is_auth()) {
-	  dout(10) << __func__ << " not auth " << *dir << dendl;
-	  continue;
-	}
-	if (!dir->can_auth_pin()) {
-	  dout(10) << __func__ << " can't auth pin " << *dir <<  dendl;
-	  dir->add_waiter(CDir::WAIT_UNFREEZE, gather.new_sub());
-	  continue;
-	}
-	dfs.push_back(dir);
       }
 
       if (gather.has_subs()) {
@@ -868,6 +1038,7 @@ void ScrubStack::handle_scrub(const cref_t<MMDSScrub> &m)
 	  header->set_origin(m->get_origin());
 	  scrubbing_map.emplace(header->get_tag(), header);
 	}
+
 	for (auto dir : dfs) {
 	  queued.insert_raw(dir->get_frag());
 	  _enqueue(dir, header, true);
@@ -948,6 +1119,7 @@ void ScrubStack::handle_scrub(const cref_t<MMDSScrub> &m)
 	const auto& header = in->get_scrub_header();
 	header->set_epoch_last_forwarded(scrub_epoch);
 	in->scrub_finished();
+	in->uninline_finished();
 
 	kick_off_scrubs();
       }
@@ -984,6 +1156,10 @@ void ScrubStack::handle_scrub_stats(const cref_t<MMDSScrubStats> &m)
     bool any_finished = false;
     bool any_repaired = false;
     std::set<std::string> scrubbing_tags;
+    std::unordered_map<std::string, unordered_map<int, std::vector<_inodeno_t>>> uninline_failed_meta_info;
+    std::unordered_map<_inodeno_t, std::string> paths;
+    std::unordered_map<std::string, std::vector<uint64_t>> counters;
+
     for (auto it = scrubbing_map.begin(); it != scrubbing_map.end(); ) {
       auto& header = it->second;
       if (header->get_num_pending() ||
@@ -994,6 +1170,17 @@ void ScrubStack::handle_scrub_stats(const cref_t<MMDSScrubStats> &m)
 	any_finished = true;
 	if (header->get_repaired())
 	  any_repaired = true;
+	auto& ufi = header->get_uninline_failed_info();
+	uninline_failed_meta_info[it->first] = ufi;
+	ufi.clear();
+	paths.merge(header->get_paths());
+	ceph_assert(header->get_paths().size() == 0);
+	std::vector<uint64_t> c{header->get_uninline_started(),
+				header->get_uninline_passed(),
+				header->get_uninline_failed(),
+				header->get_uninline_skipped()
+	};
+	counters[header->get_tag()] = c;
 	scrubbing_map.erase(it++);
       } else {
 	++it;
@@ -1003,7 +1190,11 @@ void ScrubStack::handle_scrub_stats(const cref_t<MMDSScrubStats> &m)
     scrub_epoch = m->get_epoch();
 
     auto ack = make_message<MMDSScrubStats>(scrub_epoch,
-					    std::move(scrubbing_tags), clear_stack);
+					    std::move(scrubbing_tags),
+					    std::move(uninline_failed_meta_info),
+					    std::move(paths),
+					    std::move(counters),
+					    clear_stack);
     mdcache->mds->send_message_mds(ack, 0);
 
     if (any_finished)
@@ -1017,7 +1208,40 @@ void ScrubStack::handle_scrub_stats(const cref_t<MMDSScrubStats> &m)
       stat.epoch_acked = m->get_epoch();
       stat.scrubbing_tags = m->get_scrubbing_tags();
       stat.aborting = m->is_aborting();
+      for (auto& [scrub_tag, errno_map] : m->get_uninline_failed_meta_info()) {
+	stat.uninline_failed_meta_info[scrub_tag] = errno_map;
+      }
+      stat.paths.insert(m->get_paths().begin(), m->get_paths().end());;
+      for (auto& [tag, v] : m->get_counters()) {
+	stat.counters[tag].uninline_started = v[0];
+	stat.counters[tag].uninline_passed = v[1];
+	stat.counters[tag].uninline_failed = v[2];
+	stat.counters[tag].uninline_skipped = v[3];
+      }
     }
+  }
+}
+
+void ScrubStack::move_uninline_failures_to_damage_table()
+{
+  auto mds = mdcache->mds;
+
+  for (mds_rank_t rank = 0; rank < (mds_rank_t)mds_scrub_stats.size(); rank++) {
+    auto& ufmi = mds_scrub_stats[rank].uninline_failed_meta_info;
+    auto& paths = mds_scrub_stats[rank].paths;
+
+    for (const auto& [scrub_tag, errno_ino_vec_map] : ufmi) {
+      for (const auto& [errno_, ino_vec] : errno_ino_vec_map) {
+	for (auto ino : ino_vec) {
+	  mds->damage_table.notify_uninline_failed(ino, rank, errno_, scrub_tag, paths[ino]);
+	}
+      }
+    }
+    ufmi.clear();
+    paths.clear();
+    // do not clear the counters map; we'll clear them later:
+    // - on user request or
+    // - after a grace period
   }
 }
 
@@ -1084,6 +1308,18 @@ void ScrubStack::advance_scrub_status()
       any_finished = true;
       if (header->get_repaired())
 	any_repaired = true;
+      auto& ufmi = mds_scrub_stats[0].uninline_failed_meta_info;
+      ufmi[it->first] = header->get_uninline_failed_info();
+      mds_scrub_stats[0].paths.merge(header->get_paths());
+      move_uninline_failures_to_damage_table();
+
+      auto& c = mds_scrub_stats[0].counters;
+      auto& sc = c[header->get_tag()];
+      sc.uninline_started = header->get_uninline_started();
+      sc.uninline_passed = header->get_uninline_passed();
+      sc.uninline_failed = header->get_uninline_failed();
+      sc.uninline_skipped = header->get_uninline_skipped();
+
       scrubbing_map.erase(it++);
     } else {
       ++it;
@@ -1091,7 +1327,6 @@ void ScrubStack::advance_scrub_status()
   }
 
   ++scrub_epoch;
-
   for (auto& r : up_mds) {
     if (r == 0)
       continue;
@@ -1128,4 +1363,24 @@ void ScrubStack::handle_mds_failure(mds_rank_t mds)
   }
   if (kick)
     kick_off_scrubs();
+}
+
+void ScrubStack::uninline_data(CInode *in, Context *fin)
+{
+  dout(10) << "(uninline_data) starting data uninlining for " << *in << dendl;
+
+  MDRequestRef mdr = in->mdcache->request_start_internal(CEPH_MDS_OP_UNINLINE_DATA);
+  mdr->set_filepath(filepath(in->ino()));
+  mdr->snapid = CEPH_NOSNAP;
+  mdr->no_early_reply = true;
+  mdr->internal_op_finish = fin;
+
+  in->mdcache->dispatch_request(mdr);
+}
+
+void ScrubStack::handle_conf_change(const std::set<std::string>& changed)
+{
+  if (changed.count("mds_scrub_stats_review_period")) {
+    _mds_scrub_stats_review_period = g_conf().get_val<uint64_t>("mds_scrub_stats_review_period");
+  }
 }

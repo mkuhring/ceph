@@ -26,7 +26,7 @@
  */
 
 import { Directive, Host, HostBinding, Input, Optional, SkipSelf } from '@angular/core';
-import { ControlContainer, FormControl } from '@angular/forms';
+import { ControlContainer, UntypedFormControl } from '@angular/forms';
 
 export function controlPath(name: string, parent: ControlContainer): string[] {
   // tslint:disable-next-line:no-non-null-assertion
@@ -34,7 +34,7 @@ export function controlPath(name: string, parent: ControlContainer): string[] {
 }
 
 @Directive({
-  // tslint:disable-next-line:directive-selector
+  // eslint-disable-next-line
   selector: '.form-control,.form-check-input,.custom-control-input'
 })
 export class CdFormControlDirective {
@@ -63,7 +63,7 @@ export class CdFormControlDirective {
     return controlPath(this.formControlName, this.parent);
   }
 
-  get control(): FormControl {
+  get control(): UntypedFormControl {
     return this.formDirective && this.formDirective.getControl(this);
   }
 

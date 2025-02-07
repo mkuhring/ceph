@@ -163,9 +163,21 @@ void add_snap_option(po::options_description *opt,
     (name.c_str(), po::value<std::string>(), description.c_str());
 }
 
-void add_snap_id_option(po::options_description *opt) {
+void add_snap_id_option(po::options_description *opt,
+                        ArgumentModifier modifier) {
+  std::string name = SNAPSHOT_ID;
+  std::string description = "snapshot id";
+  switch (modifier) {
+  case ARGUMENT_MODIFIER_NONE:
+  case ARGUMENT_MODIFIER_DEST:
+    break;
+  case ARGUMENT_MODIFIER_SOURCE:
+    description = "source " + description;
+    break;
+  }
+
   opt->add_options()
-    (SNAPSHOT_ID.c_str(), po::value<uint64_t>(), "snapshot id");
+    (name.c_str(), po::value<uint64_t>(), description.c_str());
 }
 
 void add_pool_options(boost::program_options::options_description *pos,
@@ -327,6 +339,18 @@ void add_snap_create_options(po::options_description *opt) {
     (SKIP_QUIESCE.c_str(), po::bool_switch(), "do not run quiesce hooks")
     (IGNORE_QUIESCE_ERROR.c_str(), po::bool_switch(),
      "ignore quiesce hook error");
+}
+
+void add_encryption_options(boost::program_options::options_description *opt) {
+  opt->add_options()
+    (ENCRYPTION_FORMAT.c_str(),
+     po::value<std::vector<EncryptionFormat>>(),
+     "encryption format (luks, luks1, luks2) [default: luks]");
+
+  opt->add_options()
+    (ENCRYPTION_PASSPHRASE_FILE.c_str(),
+     po::value<std::vector<std::string>>(),
+     "path to file containing passphrase for unlocking the image");
 }
 
 std::string get_short_features_help(bool append_suffix) {
@@ -517,6 +541,21 @@ void validate(boost::any& v, const std::vector<std::string>& values,
     v = boost::any(RBD_ENCRYPTION_ALGORITHM_AES128);
   } else if (s == "aes-256") {
     v = boost::any(RBD_ENCRYPTION_ALGORITHM_AES256);
+  } else {
+    throw po::validation_error(po::validation_error::invalid_option_value);
+  }
+}
+
+void validate(boost::any& v, const std::vector<std::string>& values,
+              EncryptionFormat *target_type, int) {
+  po::validators::check_first_occurrence(v);
+  const std::string &s = po::validators::get_single_string(values);
+  if (s == "luks") {
+    v = boost::any(EncryptionFormat{RBD_ENCRYPTION_FORMAT_LUKS});
+  } else if (s == "luks1") {
+    v = boost::any(EncryptionFormat{RBD_ENCRYPTION_FORMAT_LUKS1});
+  } else if (s == "luks2") {
+    v = boost::any(EncryptionFormat{RBD_ENCRYPTION_FORMAT_LUKS2});
   } else {
     throw po::validation_error(po::validation_error::invalid_option_value);
   }

@@ -15,8 +15,6 @@
 
 #pragma once
 
-#include "rgw_common.h"
-
 struct compression_block {
   uint64_t old_ofs;
   uint64_t new_ofs;
@@ -73,6 +71,7 @@ struct RGWCompressionInfo {
      DECODE_FINISH(bl);
   } 
   void dump(Formatter *f) const;
+  static void generate_test_instances(std::list<RGWCompressionInfo*>& o);
 };
 WRITE_CLASS_ENCODER(RGWCompressionInfo)
 

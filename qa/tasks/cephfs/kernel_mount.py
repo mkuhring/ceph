@@ -19,32 +19,38 @@ log = logging.getLogger(__name__)
 # internal metadata directory
 DEBUGFS_META_DIR = 'meta'
 
-class KernelMount(CephFSMount):
+class KernelMountBase(CephFSMount):
     def __init__(self, ctx, test_dir, client_id, client_remote,
                  client_keyring_path=None, hostfs_mntpt=None,
                  cephfs_name=None, cephfs_mntpt=None, brxnet=None,
                  client_config={}):
-        super(KernelMount, self).__init__(ctx=ctx, test_dir=test_dir,
+        super(KernelMountBase, self).__init__(ctx=ctx, test_dir=test_dir,
             client_id=client_id, client_remote=client_remote,
             client_keyring_path=client_keyring_path, hostfs_mntpt=hostfs_mntpt,
-            cephfs_name=cephfs_name, cephfs_mntpt=cephfs_mntpt, brxnet=brxnet)
+            cephfs_name=cephfs_name, cephfs_mntpt=cephfs_mntpt, brxnet=brxnet,
+            client_config=client_config)
 
-        self.client_config = client_config
-        self.dynamic_debug = client_config.get('dynamic_debug', False)
-        self.rbytes = client_config.get('rbytes', False)
+        if client_config.get('debug', False):
+            self.client_remote.run(args=["sudo", "bash", "-c", "echo 'module ceph +p' > /sys/kernel/debug/dynamic_debug/control"])
+            self.client_remote.run(args=["sudo", "bash", "-c", "echo 'module libceph +p' > /sys/kernel/debug/dynamic_debug/control"])
+
+        self.dynamic_debug = self.client_config.get('dynamic_debug', False)
+        self.rbytes = self.client_config.get('rbytes', False)
         self.snapdirname = client_config.get('snapdirname', '.snap')
-        self.syntax_style = client_config.get('syntax', 'v2')
+        self.syntax_style = self.client_config.get('syntax', 'v2')
         self.inst = None
         self.addr = None
         self._mount_bin = ['adjust-ulimits', 'ceph-coverage', self.test_dir +\
                            '/archive/coverage', '/bin/mount', '-t', 'ceph']
 
-    def mount(self, mntopts=[], check_status=True, **kwargs):
+    def mount(self, mntopts=None, check_status=True, **kwargs):
         self.update_attrs(**kwargs)
         self.assert_and_log_minimum_mount_details()
 
         self.setup_netns()
 
+        if not self.cephfs_mntpt:
+            self.cephfs_mntpt = '/'
         if not self.cephfs_name:
             self.cephfs_name = 'cephfs'
 
@@ -61,6 +67,16 @@ class KernelMount(CephFSMount):
             if kmount_count == 0:
                 self.enable_dynamic_debug()
             self.ctx[f'kmount_count.{self.client_remote.hostname}'] = kmount_count + 1
+
+        try:
+            self.gather_mount_info()
+        except:
+            log.warn('failed to fetch mount info - tests depending on mount addr/inst may fail!')
+
+    def gather_mount_info(self):
+        self.id = self._get_global_id()
+        self.get_global_inst()
+        self.get_global_addr()
 
     def _run_mount_cmd(self, mntopts, check_status):
         mount_cmd = self._get_mount_cmd(mntopts)
@@ -133,6 +149,11 @@ class KernelMount(CephFSMount):
             self.cleanup()
             return
 
+        if self.is_blocked():
+            self._run_umount_lf()
+            self.cleanup()
+            return
+
         log.debug('Unmounting client client.{id}...'.format(id=self.client_id))
 
         try:
@@ -173,11 +194,7 @@ class KernelMount(CephFSMount):
                 raise
 
             # force delete the netns and umount
-            log.debug('Force/lazy unmounting on client.{id}...'.format(id=self.client_id))
-            self.client_remote.run(args=['sudo', 'umount', '-f', '-l',
-                                         self.mountpoint], timeout=timeout,
-                                   omit_sudo=False)
-
+            self._run_umount_lf()
             self.cleanup()
 
     def wait_until_mounted(self):
@@ -186,11 +203,6 @@ class KernelMount(CephFSMount):
         as the initial mount() function returns.
         """
         assert self.is_mounted()
-
-    def teardown(self):
-        super(KernelMount, self).teardown()
-        if self.is_mounted():
-            self.umount()
 
     def _get_debug_dir(self):
         """
@@ -243,9 +255,10 @@ class KernelMount(CephFSMount):
                 import json
 
                 def get_id_to_dir():
-                    result = {}
+                    meta_dir = "{meta_dir}"
+                    result = dict()
                     for dir in glob.glob("/sys/kernel/debug/ceph/*"):
-                        if os.path.basename(dir) == DEBUGFS_META_DIR:
+                        if os.path.basename(dir) == meta_dir:
                             continue
                         mds_sessions_lines = open(os.path.join(dir, "mds_sessions")).readlines()
                         global_id = mds_sessions_lines[0].split()[1].strip('"')
@@ -253,7 +266,7 @@ class KernelMount(CephFSMount):
                         result[client_id] = global_id
                     return result
                 print(json.dumps(get_id_to_dir()))
-            """)
+            """.format(meta_dir=DEBUGFS_META_DIR))
 
             output = self.client_remote.sh([
                 'sudo', 'python3', '-c', pyscript
@@ -325,7 +338,7 @@ echo '{fdata}' | sudo tee /sys/kernel/debug/dynamic_debug/control
         if self.inst is not None:
             return self.inst
 
-        client_gid = "client%d" % self.get_global_id()
+        client_gid = "client%d" % int(self.get_global_id())
         self.inst = " ".join([client_gid, self._global_addr])
         return self.inst
 
@@ -375,3 +388,5 @@ echo '{fdata}' | sudo tee /sys/kernel/debug/dynamic_debug/control
             else:
                 return 0
         return int(re.findall(r'read.*', buf)[0].split()[1])
+
+KernelMount = KernelMountBase

@@ -19,6 +19,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <ranges>
 #include <string_view>
 
 #include <errno.h>
@@ -47,8 +48,16 @@ static inline const auto MDS_FEATURE_INCOMPAT_INLINE = CompatSet::Feature(7, "md
 static inline const auto MDS_FEATURE_INCOMPAT_NOANCHOR = CompatSet::Feature(8, "no anchor table");
 static inline const auto MDS_FEATURE_INCOMPAT_FILE_LAYOUT_V2 = CompatSet::Feature(9, "file layout v2");
 static inline const auto MDS_FEATURE_INCOMPAT_SNAPREALM_V2 = CompatSet::Feature(10, "snaprealm v2");
+static inline const auto MDS_FEATURE_INCOMPAT_MINORLOGSEGMENTS = CompatSet::Feature(11, "minor log segments");
+static inline const auto MDS_FEATURE_INCOMPAT_QUIESCE_SUBVOLUMES = CompatSet::Feature(12, "quiesce subvolumes");
 
 #define MDS_FS_NAME_DEFAULT "cephfs"
+
+/*
+ * Maximum size of xattrs the MDS can handle per inode by default.  This
+ * includes the attribute name and 4+4 bytes for the key/value sizes.
+ */
+#define MDS_MAX_XATTR_SIZE (1<<16) /* 64K */
 
 class health_check_map_t;
 
@@ -196,6 +205,9 @@ public:
   uint64_t get_max_filesize() const { return max_file_size; }
   void set_max_filesize(uint64_t m) { max_file_size = m; }
 
+  uint64_t get_max_xattr_size() const { return max_xattr_size; }
+  void set_max_xattr_size(uint64_t m) { max_xattr_size = m; }
+
   void set_min_compat_client(ceph_release_t version);
 
   void add_required_client_feature(size_t bit) {
@@ -233,6 +245,15 @@ public:
   void clear_standby_replay_allowed() { clear_flag(CEPH_MDSMAP_ALLOW_STANDBY_REPLAY); }
   bool allows_standby_replay() const { return test_flag(CEPH_MDSMAP_ALLOW_STANDBY_REPLAY); }
   bool was_standby_replay_ever_allowed() const { return ever_allowed_features & CEPH_MDSMAP_ALLOW_STANDBY_REPLAY; }
+
+  void set_balance_automate() {
+    set_flag(CEPH_MDSMAP_BALANCE_AUTOMATE);
+    ever_allowed_features |= CEPH_MDSMAP_BALANCE_AUTOMATE;
+    explicitly_allowed_features |= CEPH_MDSMAP_BALANCE_AUTOMATE;
+  }
+  void clear_balance_automate() { clear_flag(CEPH_MDSMAP_BALANCE_AUTOMATE); }
+  bool allows_balance_automate() const { return test_flag(CEPH_MDSMAP_BALANCE_AUTOMATE); }
+  bool was_balance_automate_ever_allowed() const { return ever_allowed_features & CEPH_MDSMAP_BALANCE_AUTOMATE; }
 
   void set_multimds_snaps_allowed() {
     set_flag(CEPH_MDSMAP_ALLOW_MULTIMDS_SNAPS);
@@ -275,8 +296,51 @@ public:
   const std::string get_balancer() const { return balancer; }
   void set_balancer(std::string val) { balancer.assign(val); }
 
+  const std::bitset<MAX_MDS>& get_bal_rank_mask_bitset() const;
+  void set_bal_rank_mask(std::string val);
+  unsigned get_num_mdss_in_rank_mask_bitset() const { return num_mdss_in_rank_mask_bitset; }
+  void update_num_mdss_in_rank_mask_bitset();
+  int hex2bin(std::string hex_string, std::string &bin_string, unsigned int max_bits, std::ostream& ss) const;
+
+  typedef enum
+  {
+    BAL_RANK_MASK_TYPE_ANY = 0,
+    BAL_RANK_MASK_TYPE_ALL = 1,
+    BAL_RANK_MASK_TYPE_NONE = 2,
+  } bal_rank_mask_type_t;
+
+  const bool check_special_bal_rank_mask(std::string val, bal_rank_mask_type_t type) const;
+
   mds_rank_t get_tableserver() const { return tableserver; }
   mds_rank_t get_root() const { return root; }
+
+  void get_quiesce_db_cluster(mds_gid_t &leader, std::unordered_set<mds_gid_t> &members) const {
+    leader = qdb_cluster_leader;
+    members = qdb_cluster_members; 
+  }
+
+  mds_gid_t get_quiesce_db_cluster_leader() const {
+    return qdb_cluster_leader;
+  }
+
+  std::unordered_set<mds_gid_t> const& get_quiesce_db_cluster_members() const
+  {
+    return qdb_cluster_members;
+  }
+
+  bool update_quiesce_db_cluster(mds_gid_t const& leader, std::same_as<std::unordered_set<mds_gid_t>> auto && members) {
+    if (leader == qdb_cluster_leader && members == qdb_cluster_members) {
+      return false;
+    }
+
+    ceph_assert(leader == MDS_GID_NONE || mds_info.contains(leader));
+    ceph_assert(std::ranges::all_of(members, [this](auto &m) {return mds_info.contains(m);}));
+
+    qdb_cluster_leader = leader;
+    qdb_cluster_members = members;
+
+    return true;
+  }
 
   const std::vector<int64_t> &get_data_pools() const { return data_pools; }
   int64_t get_first_data_pool() const { return *data_pools.begin(); }
@@ -357,7 +421,7 @@ public:
   }
 
   // features
-  uint64_t get_up_features();
+  uint64_t get_up_features() const;
 
   /**
    * Get MDS ranks which are in but not up.
@@ -600,10 +664,14 @@ protected:
 
   mds_rank_t tableserver = 0;   // which MDS has snaptable
   mds_rank_t root = 0;          // which MDS has root directory
+  std::unordered_set<mds_gid_t> qdb_cluster_members;
+  mds_gid_t qdb_cluster_leader = MDS_GID_NONE;
 
   __u32 session_timeout = 60;
   __u32 session_autoclose = 300;
   uint64_t max_file_size = 1ULL<<40; /* 1TB */
+
+  uint64_t max_xattr_size = MDS_MAX_XATTR_SIZE;
 
   feature_bitset_t required_client_features;
 
@@ -626,6 +694,10 @@ protected:
   mds_rank_t standby_count_wanted = -1;
   std::string balancer;    /* The name/version of the mantle balancer (i.e. the rados obj name) */
 
+  std::string bal_rank_mask = "-1";
+  std::bitset<MAX_MDS> bal_rank_mask_bitset;
+  uint32_t num_mdss_in_rank_mask_bitset;
+
   std::set<mds_rank_t> in;              // currently defined cluster
 
   // which ranks are failed, stopped, damaged (i.e. not held by a daemon)
@@ -638,13 +710,15 @@ protected:
 
   bool inline_data_enabled = false;
 
-  uint64_t cached_up_features = 0;
 private:
   inline static const std::map<int, std::string> flag_display = {
     {CEPH_MDSMAP_NOT_JOINABLE, "joinable"}, //inverse for user display
     {CEPH_MDSMAP_ALLOW_SNAPS, "allow_snaps"},
     {CEPH_MDSMAP_ALLOW_MULTIMDS_SNAPS, "allow_multimds_snaps"},
-    {CEPH_MDSMAP_ALLOW_STANDBY_REPLAY, "allow_standby_replay"}
+    {CEPH_MDSMAP_ALLOW_STANDBY_REPLAY, "allow_standby_replay"},
+    {CEPH_MDSMAP_REFUSE_CLIENT_SESSION, "refuse_client_session"},
+    {CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS, "refuse_standby_for_another_fs"},
+    {CEPH_MDSMAP_BALANCE_AUTOMATE, "balance_automate"}
   };
 };
 WRITE_CLASS_ENCODER_FEATURES(MDSMap::mds_info_t)

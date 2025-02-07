@@ -12,6 +12,7 @@ import boto3
 from botocore.client import Config
 import os
 import subprocess
+import json
 
 log = logging.getLogger('bucket_notification.tests')
 
@@ -26,7 +27,7 @@ def put_object_tagging(conn, bucket_name, key, tags):
 
 def make_request(conn, method, resource, parameters=None, sign_parameters=False, extra_parameters=None):
     """generic request sending to pubsub radogw
-    should cover: topics, notificatios and subscriptions
+    should cover: topics, notifications and subscriptions
     """
     url_params = ''
     if parameters is not None:
@@ -56,23 +57,6 @@ def make_request(conn, method, resource, parameters=None, sign_parameters=False,
     http_conn.close()
     return data.decode('utf-8'), status
 
-def delete_all_s3_topics(zone, region):
-    try:
-        conn = zone.secure_conn if zone.secure_conn is not None else zone.conn
-        protocol = 'https' if conn.is_secure else 'http'
-        client = boto3.client('sns',
-                endpoint_url=protocol+'://'+conn.host+':'+str(conn.port),
-                aws_access_key_id=conn.aws_access_key_id,
-                aws_secret_access_key=conn.aws_secret_access_key,
-                region_name=region,
-                verify='./cert.pem')
-
-        topics = client.list_topics()['Topics']
-        for topic in topics:
-            print('topic cleanup, deleting: ' + topic['TopicArn'])
-            assert client.delete_topic(TopicArn=topic['TopicArn'])['ResponseMetadata']['HTTPStatusCode'] == 200
-    except Exception as err:
-        print('failed to do topic cleanup: ' + str(err))
 
 def delete_all_objects(conn, bucket_name):
     client = boto3.client('s3',
@@ -95,7 +79,7 @@ class PSTopicS3:
     POST ?Action=GetTopic&TopicArn=<topic-arn>
     POST ?Action=DeleteTopic&TopicArn=<topic-arn>
     """
-    def __init__(self, conn, topic_name, region, endpoint_args=None, opaque_data=None):
+    def __init__(self, conn, topic_name, region, endpoint_args=None, opaque_data=None, policy_text=None):
         self.conn = conn
         self.topic_name = topic_name.strip()
         assert self.topic_name
@@ -105,6 +89,8 @@ class PSTopicS3:
             self.attributes = {nvp[0] : nvp[1] for nvp in urlparse.parse_qsl(endpoint_args, keep_blank_values=True)}
         if opaque_data is not None:
             self.attributes['OpaqueData'] = opaque_data
+        if policy_text is not None:
+            self.attributes['Policy'] = policy_text
         protocol = 'https' if conn.is_secure else 'http'
         self.client = boto3.client('sns',
                            endpoint_url=protocol+'://'+conn.host+':'+str(conn.port),
@@ -113,9 +99,9 @@ class PSTopicS3:
                            region_name=region,
                            verify='./cert.pem')
 
-    def get_config(self):
+    def get_config(self, topic_arn=None):
         """get topic info"""
-        parameters = {'Action': 'GetTopic', 'TopicArn': self.topic_arn}
+        parameters = {'Action': 'GetTopic', 'TopicArn': (topic_arn if topic_arn is not None else self.topic_arn)}
         body = urlparse.urlencode(parameters)
         string_date = strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime())
         content_type = 'application/x-www-form-urlencoded; charset=utf-8'
@@ -148,10 +134,17 @@ class PSTopicS3:
         result = self.client.create_topic(Name=self.topic_name, Attributes=self.attributes)
         self.topic_arn = result['TopicArn']
         return self.topic_arn
+    
+    def set_attributes(self, attribute_name, attribute_val, topic_arn=None):
+        """set topic attributes."""
+        result = self.client.set_topic_attributes(TopicArn=(
+            topic_arn if topic_arn is not None else self.topic_arn), AttributeName=attribute_name, AttributeValue=attribute_val)
+        return result['ResponseMetadata']['HTTPStatusCode']
 
-    def del_config(self):
+
+    def del_config(self, topic_arn=None):
         """delete topic"""
-        result = self.client.delete_topic(TopicArn=self.topic_arn)
+        result = self.client.delete_topic(TopicArn=(topic_arn if topic_arn is not None else self.topic_arn))
         return result['ResponseMetadata']['HTTPStatusCode']
 
     def get_list(self):
@@ -244,8 +237,27 @@ def bash(cmd, **kwargs):
     s = process.communicate()[0].decode('utf-8')
     return (s, process.returncode)
 
-def admin(args, **kwargs):
+def admin(args, cluster='noname', **kwargs):
     """ radosgw-admin command """
-    cmd = [test_path + 'test-rgw-call.sh', 'call_rgw_admin', 'noname'] + args
+    cmd = [test_path + 'test-rgw-call.sh', 'call_rgw_admin', cluster] + args
     return bash(cmd, **kwargs)
+
+def delete_all_topics(conn, tenant, cluster):
+    """ delete all topics """
+    if tenant == '':
+        topics_result = admin(['topic', 'list'], cluster)
+        topics_json = json.loads(topics_result[0])
+        if 'topics' not in topics_json:
+            topics_json = topics_json.get('result',{})
+        for topic in topics_json['topics']:
+            rm_result = admin(['topic', 'rm', '--topic', topic['name']], cluster)
+            print(rm_result)
+    else:
+        topics_result = admin(['topic', 'list', '--tenant', tenant], cluster)
+        topics_json = json.loads(topics_result[0])
+        if 'topics' not in topics_json:
+            topics_json = topics_json.get('result',{})
+        for topic in topics_json['topics']:
+            rm_result = admin(['topic', 'rm', '--tenant', tenant, '--topic', topic['name']], cluster)
+            print(rm_result)
 

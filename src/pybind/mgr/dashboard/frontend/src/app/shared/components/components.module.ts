@@ -13,14 +13,38 @@ import {
   NgbTooltipModule
 } from '@ng-bootstrap/ng-bootstrap';
 import { ClickOutsideModule } from 'ng-click-outside';
-import { ChartsModule } from 'ng2-charts';
+import { provideCharts, withDefaultRegisterables, BaseChartDirective } from 'ng2-charts';
 import { SimplebarAngularModule } from 'simplebar-angular';
+import {
+  UIShellModule,
+  ButtonModule,
+  NotificationModule,
+  IconModule,
+  IconService,
+  TooltipModule,
+  GridModule,
+  AccordionModule,
+  LoadingModule,
+  ModalModule,
+  InputModule,
+  CheckboxModule,
+  DatePickerModule,
+  TimePickerModule,
+  TimePickerSelectModule,
+  NumberModule,
+  DropdownModule,
+  SelectModule,
+  ComboBoxModule,
+  ProgressIndicatorModule
+} from 'carbon-components-angular';
 
 import { MotdComponent } from '~/app/shared/components/motd/motd.component';
 import { DirectivesModule } from '../directives/directives.module';
 import { PipesModule } from '../pipes/pipes.module';
 import { AlertPanelComponent } from './alert-panel/alert-panel.component';
 import { BackButtonComponent } from './back-button/back-button.component';
+import { CdLabelComponent } from './cd-label/cd-label.component';
+import { ColorClassFromTextPipe } from './cd-label/color-class-from-text.pipe';
 import { ConfigOptionComponent } from './config-option/config-option.component';
 import { ConfirmationModalComponent } from './confirmation-modal/confirmation-modal.component';
 import { Copy2ClipboardButtonComponent } from './copy2clipboard-button/copy2clipboard-button.component';
@@ -47,6 +71,18 @@ import { SubmitButtonComponent } from './submit-button/submit-button.component';
 import { TelemetryNotificationComponent } from './telemetry-notification/telemetry-notification.component';
 import { UsageBarComponent } from './usage-bar/usage-bar.component';
 import { WizardComponent } from './wizard/wizard.component';
+import { CardComponent } from './card/card.component';
+import { CardRowComponent } from './card-row/card-row.component';
+import { CodeBlockComponent } from './code-block/code-block.component';
+import { VerticalNavigationComponent } from './vertical-navigation/vertical-navigation.component';
+import { CardGroupComponent } from './card-group/card-group.component';
+import { HelpTextComponent } from './help-text/help-text.component';
+import { FormAdvancedFieldsetComponent } from './form-advanced-fieldset/form-advanced-fieldset.component';
+import { UpgradableComponent } from './upgradable/upgradable.component';
+import { ProgressComponent } from './progress/progress.component';
+
+// Icons
+import InfoIcon from '@carbon/icons/es/information/16';
 
 @NgModule({
   imports: [
@@ -57,7 +93,6 @@ import { WizardComponent } from './wizard/wizard.component';
     NgbPopoverModule,
     NgbProgressbarModule,
     NgbTooltipModule,
-    ChartsModule,
     ReactiveFormsModule,
     PipesModule,
     DirectivesModule,
@@ -66,7 +101,27 @@ import { WizardComponent } from './wizard/wizard.component';
     SimplebarAngularModule,
     RouterModule,
     NgbDatepickerModule,
-    NgbTimepickerModule
+    NgbTimepickerModule,
+    UIShellModule,
+    ButtonModule,
+    NotificationModule,
+    IconModule,
+    TooltipModule,
+    GridModule,
+    AccordionModule,
+    LoadingModule,
+    ModalModule,
+    InputModule,
+    NumberModule,
+    CheckboxModule,
+    DatePickerModule,
+    TimePickerModule,
+    TimePickerSelectModule,
+    DropdownModule,
+    SelectModule,
+    ComboBoxModule,
+    ProgressIndicatorModule,
+    BaseChartDirective
   ],
   declarations: [
     SparklineComponent,
@@ -97,9 +152,20 @@ import { WizardComponent } from './wizard/wizard.component';
     FormButtonPanelComponent,
     MotdComponent,
     WizardComponent,
-    CustomLoginBannerComponent
+    CustomLoginBannerComponent,
+    CdLabelComponent,
+    ColorClassFromTextPipe,
+    CardComponent,
+    CardRowComponent,
+    CodeBlockComponent,
+    VerticalNavigationComponent,
+    CardGroupComponent,
+    HelpTextComponent,
+    FormAdvancedFieldsetComponent,
+    UpgradableComponent,
+    ProgressComponent
   ],
-  providers: [],
+  providers: [provideCharts(withDefaultRegisterables())],
   exports: [
     SparklineComponent,
     HelperComponent,
@@ -126,7 +192,21 @@ import { WizardComponent } from './wizard/wizard.component';
     FormButtonPanelComponent,
     MotdComponent,
     WizardComponent,
-    CustomLoginBannerComponent
+    CustomLoginBannerComponent,
+    CdLabelComponent,
+    CardComponent,
+    CardRowComponent,
+    CodeBlockComponent,
+    VerticalNavigationComponent,
+    CardGroupComponent,
+    HelpTextComponent,
+    FormAdvancedFieldsetComponent,
+    UpgradableComponent,
+    ProgressComponent
   ]
 })
-export class ComponentsModule {}
+export class ComponentsModule {
+  constructor(private iconService: IconService) {
+    this.iconService.registerAll([InfoIcon]);
+  }
+}

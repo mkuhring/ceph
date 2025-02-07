@@ -76,12 +76,27 @@ public:
 
   int dump_loads(Formatter *f, int64_t depth = -1) const;
 
+  bool get_bal_export_pin() const {
+    return bal_export_pin;
+  }
+  int64_t get_bal_merge_size() const {
+    return bal_merge_size;
+  }
+  int64_t get_bal_split_size() const {
+    return bal_split_size;
+  }
+  double get_bal_fragment_fast_factor() const {
+    return bal_fragment_fast_factor;
+  }
+
 private:
   typedef struct {
     std::map<mds_rank_t, double> targets;
     std::map<mds_rank_t, double> imported;
     std::map<mds_rank_t, double> exported;
   } balance_state_t;
+
+  static const unsigned int AUTH_TREES_THRESHOLD = 5;
 
   //set up the rebalancing targets for export and do one if the
   //MDSMap is up to date
@@ -102,11 +117,11 @@ private:
                    mds_rank_t ex, double& maxex,
                    mds_rank_t im, double& maxim);
 
-  double get_maxim(balance_state_t &state, mds_rank_t im) {
-    return target_load - mds_meta_load[im] - state.imported[im];
+  double get_maxim(balance_state_t &state, mds_rank_t im, double im_target_load) {
+    return im_target_load - mds_meta_load[im] - state.imported[im];
   }
-  double get_maxex(balance_state_t &state, mds_rank_t ex) {
-    return mds_meta_load[ex] - target_load - state.exported[ex];
+  double get_maxex(balance_state_t &state, mds_rank_t ex, double ex_target_load) {
+    return mds_meta_load[ex] - ex_target_load - state.exported[ex];
   }
 
   /**
@@ -117,10 +132,24 @@ private:
    * export targets message again.
    */
   void try_rebalance(balance_state_t& state);
+  bool test_rank_mask(mds_rank_t rank);
 
   bool bal_fragment_dirs;
   int64_t bal_fragment_interval;
-  static const unsigned int AUTH_TREES_THRESHOLD = 5;
+  int64_t bal_interval;
+  int64_t bal_max_until;
+  int64_t bal_mode;
+  bool bal_export_pin;
+  double bal_sample_interval;
+  double bal_split_rd;
+  double bal_split_wr;
+  double bal_replicate_threshold;
+  double bal_unreplicate_threshold;
+  double bal_fragment_fast_factor;
+  int64_t bal_split_bits;
+  int64_t bal_split_size;
+  int64_t bal_merge_size;
+  int64_t num_bal_times;
 
   MDSRank *mds;
   Messenger *messenger;

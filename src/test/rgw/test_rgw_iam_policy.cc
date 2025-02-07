@@ -12,6 +12,8 @@
  *
  */
 
+#include "rgw_iam_policy.h"
+
 #include <string>
 
 #include <boost/intrusive_ptr.hpp>
@@ -20,21 +22,23 @@
 #include <gtest/gtest.h>
 
 #include "include/stringify.h"
+#include "common/async/context_pool.h"
 #include "common/code_environment.h"
 #include "common/ceph_context.h"
 #include "global/global_init.h"
-#include "rgw/rgw_auth.h"
-#include "rgw/rgw_iam_policy.h"
-#include "rgw/rgw_op.h"
+#include "rgw_auth.h"
+#include "rgw_auth_registry.h"
+#include "rgw_iam_managed_policy.h"
+#include "rgw_op.h"
+#include "rgw_process_env.h"
 #include "rgw_sal_rados.h"
-
+#include "driver/rados/rgw_zone.h"
+#include "rgw_sal_config.h"
 
 using std::string;
-using std::vector;
 
 using boost::container::flat_set;
 using boost::intrusive_ptr;
-using boost::make_optional;
 using boost::none;
 
 using rgw::auth::Identity;
@@ -46,9 +50,10 @@ using rgw::IAM::Environment;
 using rgw::Partition;
 using rgw::IAM::Policy;
 using rgw::IAM::s3All;
-using rgw::IAM::s3Count;
+using rgw::IAM::s3objectlambdaAll;
 using rgw::IAM::s3GetAccelerateConfiguration;
 using rgw::IAM::s3GetBucketAcl;
+using rgw::IAM::s3GetBucketOwnershipControls;
 using rgw::IAM::s3GetBucketCORS;
 using rgw::IAM::s3GetBucketLocation;
 using rgw::IAM::s3GetBucketLogging;
@@ -70,10 +75,11 @@ using rgw::IAM::s3GetObjectTagging;
 using rgw::IAM::s3GetObjectVersion;
 using rgw::IAM::s3GetObjectVersionTagging;
 using rgw::IAM::s3GetObjectVersionTorrent;
+using rgw::IAM::s3GetObjectAttributes;
+using rgw::IAM::s3GetObjectVersionAttributes;
 using rgw::IAM::s3GetPublicAccessBlock;
 using rgw::IAM::s3GetReplicationConfiguration;
 using rgw::IAM::s3ListAllMyBuckets;
-using rgw::IAM::s3ListBucket;
 using rgw::IAM::s3ListBucket;
 using rgw::IAM::s3ListBucketMultipartUploads;
 using rgw::IAM::s3ListBucketVersions;
@@ -84,6 +90,35 @@ using rgw::IAM::s3PutBucketPolicy;
 using rgw::IAM::s3GetBucketObjectLockConfiguration;
 using rgw::IAM::s3GetObjectRetention;
 using rgw::IAM::s3GetObjectLegalHold;
+using rgw::IAM::s3DescribeJob;
+using rgw::IAM::s3objectlambdaGetObject;
+using rgw::IAM::s3objectlambdaListBucket;
+using rgw::IAM::iamGenerateCredentialReport;
+using rgw::IAM::iamGenerateServiceLastAccessedDetails;
+using rgw::IAM::iamGetUserPolicy;
+using rgw::IAM::iamGetRole;
+using rgw::IAM::iamGetRolePolicy;
+using rgw::IAM::iamGetOIDCProvider;
+using rgw::IAM::iamGetUser;
+using rgw::IAM::iamListUserPolicies;
+using rgw::IAM::iamListAttachedUserPolicies;
+using rgw::IAM::iamListRoles;
+using rgw::IAM::iamListRolePolicies;
+using rgw::IAM::iamListAttachedRolePolicies;
+using rgw::IAM::iamListOIDCProviders;
+using rgw::IAM::iamListRoleTags;
+using rgw::IAM::iamListUsers;
+using rgw::IAM::iamListAccessKeys;
+using rgw::IAM::iamGetGroup;
+using rgw::IAM::iamListGroups;
+using rgw::IAM::iamListGroupsForUser;
+using rgw::IAM::iamGetGroupPolicy;
+using rgw::IAM::iamListGroupPolicies;
+using rgw::IAM::iamListAttachedGroupPolicies;
+using rgw::IAM::iamSimulateCustomPolicy;
+using rgw::IAM::iamSimulatePrincipalPolicy;
+using rgw::IAM::snsGetTopicAttributes;
+using rgw::IAM::snsListTopics;
 using rgw::Service;
 using rgw::IAM::TokenID;
 using rgw::IAM::Version;
@@ -93,24 +128,42 @@ using rgw::IAM::iamCreateRole;
 using rgw::IAM::iamDeleteRole;
 using rgw::IAM::iamAll;
 using rgw::IAM::stsAll;
+using rgw::IAM::snsAll;
+using rgw::IAM::organizationsAll;
 using rgw::IAM::allCount;
+
+using rgw::IAM::s3AllValue;
+using rgw::IAM::s3objectlambdaAllValue;
+using rgw::IAM::iamAllValue;
+using rgw::IAM::stsAllValue;
+using rgw::IAM::snsAllValue;
+using rgw::IAM::organizationsAllValue;
+using rgw::IAM::allValue;
+
+using rgw::IAM::get_managed_policy;
 
 class FakeIdentity : public Identity {
   const Principal id;
 public:
 
   explicit FakeIdentity(Principal&& id) : id(std::move(id)) {}
+
+  ACLOwner get_aclowner() const override {
+    ceph_abort();
+    return {};
+  }
+
   uint32_t get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const override {
     ceph_abort();
     return 0;
   };
 
-  bool is_admin_of(const rgw_user& uid) const override {
+  bool is_admin_of(const rgw_owner& o) const override {
     ceph_abort();
     return false;
   }
 
-  bool is_owner_of(const rgw_user& uid) const override {
+  bool is_owner_of(const rgw_owner& owner) const override {
     ceph_abort();
     return false;
   }
@@ -122,23 +175,32 @@ public:
 
   string get_acct_name() const override {
     abort();
-    return 0;
+    return string{};
   }
 
   string get_subuser() const override {
     abort();
-    return 0;
+    return string{};
+  }
+
+  const std::string& get_tenant() const override {
+    ceph_abort();
+    static std::string empty;
+    return empty;
+  }
+
+  const std::optional<RGWAccountInfo>& get_account() const override {
+    ceph_abort();
+    static std::optional<RGWAccountInfo> empty;
+    return empty;
   }
 
   void to_str(std::ostream& out) const override {
     out << id;
   }
 
-  bool is_identity(const flat_set<Principal>& ids) const override {
-    if (id.is_wildcard() && (!ids.empty())) {
-      return true;
-    }
-    return ids.find(id) != ids.end() || ids.find(Principal::wildcard()) != ids.end();
+  bool is_identity(const Principal& p) const override {
+    return id.is_wildcard() || p.is_wildcard() || p == id;
   }
 
   uint32_t get_identity_type() const override {
@@ -159,15 +221,14 @@ protected:
   static string example7;
 public:
   PolicyTest() {
-    cct = new CephContext(CEPH_ENTITY_TYPE_CLIENT);
+    cct.reset(new CephContext(CEPH_ENTITY_TYPE_CLIENT), false);
   }
 };
 
 TEST_F(PolicyTest, Parse1) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(example1)));
+  ASSERT_NO_THROW(p = Policy(cct.get(), &arbitrary_tenant, example1, true));
   ASSERT_TRUE(p);
 
   EXPECT_EQ(p->text, example1);
@@ -195,8 +256,7 @@ TEST_F(PolicyTest, Parse1) {
 }
 
 TEST_F(PolicyTest, Eval1) {
-  auto p  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(example1));
+  auto p  = Policy(cct.get(), &arbitrary_tenant, example1, true);
   Environment e;
 
   ARN arn1(Partition::aws, Service::s3,
@@ -219,8 +279,7 @@ TEST_F(PolicyTest, Eval1) {
 TEST_F(PolicyTest, Parse2) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(example2)));
+  ASSERT_NO_THROW(p = Policy(cct.get(), &arbitrary_tenant, example2, true));
   ASSERT_TRUE(p);
 
   EXPECT_EQ(p->text, example2);
@@ -232,11 +291,11 @@ TEST_F(PolicyTest, Parse2) {
   EXPECT_FALSE(p->statements[0].princ.empty());
   EXPECT_EQ(p->statements[0].princ.size(), 1U);
   EXPECT_EQ(*p->statements[0].princ.begin(),
-	    Principal::tenant("ACCOUNT-ID-WITHOUT-HYPHENS"));
+	    Principal::account("ACCOUNT-ID-WITHOUT-HYPHENS"));
   EXPECT_TRUE(p->statements[0].noprinc.empty());
   EXPECT_EQ(p->statements[0].effect, Effect::Allow);
   Action_t act;
-  for (auto i = 0ULL; i < s3Count; i++)
+  for (auto i = 0ULL; i < s3All; i++)
     act[i] = 1;
   act[s3All] = 1;
   EXPECT_EQ(p->statements[0].action, act);
@@ -261,16 +320,15 @@ TEST_F(PolicyTest, Parse2) {
 }
 
 TEST_F(PolicyTest, Eval2) {
-  auto p  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(example2));
+  auto p  = Policy(cct.get(), &arbitrary_tenant, example2, true);
   Environment e;
 
   auto trueacct = FakeIdentity(
-    Principal::tenant("ACCOUNT-ID-WITHOUT-HYPHENS"));
+    Principal::account("ACCOUNT-ID-WITHOUT-HYPHENS"));
 
   auto notacct = FakeIdentity(
-    Principal::tenant("some-other-account"));
-  for (auto i = 0ULL; i < s3Count; ++i) {
+    Principal::account("some-other-account"));
+  for (auto i = 0ULL; i < s3All; ++i) {
     ARN arn1(Partition::aws, Service::s3,
 			 "", arbitrary_tenant, "mybucket");
     EXPECT_EQ(p.eval(e, trueacct, i, arn1),
@@ -302,8 +360,7 @@ TEST_F(PolicyTest, Eval2) {
 TEST_F(PolicyTest, Parse3) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(example3)));
+  ASSERT_NO_THROW(p = Policy(cct.get(), &arbitrary_tenant, example3, true));
   ASSERT_TRUE(p);
 
   EXPECT_EQ(p->text, example3);
@@ -364,8 +421,11 @@ TEST_F(PolicyTest, Parse3) {
   act2[s3GetObjectVersionAcl] = 1;
   act2[s3GetObjectTorrent] = 1;
   act2[s3GetObjectVersionTorrent] = 1;
+  act2[s3GetObjectAttributes] = 1;
+  act2[s3GetObjectVersionAttributes] = 1;
   act2[s3GetAccelerateConfiguration] = 1;
   act2[s3GetBucketAcl] = 1;
+  act2[s3GetBucketOwnershipControls] = 1;
   act2[s3GetBucketCORS] = 1;
   act2[s3GetBucketVersioning] = 1;
   act2[s3GetBucketRequestPayment] = 1;
@@ -416,8 +476,7 @@ TEST_F(PolicyTest, Parse3) {
 }
 
 TEST_F(PolicyTest, Eval3) {
-  auto p  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(example3));
+  auto p  = Policy(cct.get(), &arbitrary_tenant, example3, true);
   Environment em;
   Environment tr = { { "aws:MultiFactorAuthPresent", "true" } };
   Environment fa = { { "aws:MultiFactorAuthPresent", "false" } };
@@ -432,10 +491,13 @@ TEST_F(PolicyTest, Eval3) {
   s3allow[s3GetObjectVersion] = 1;
   s3allow[s3GetObjectAcl] = 1;
   s3allow[s3GetObjectVersionAcl] = 1;
+  s3allow[s3GetObjectAttributes] = 1;
+  s3allow[s3GetObjectVersionAttributes] = 1;
   s3allow[s3GetObjectTorrent] = 1;
   s3allow[s3GetObjectVersionTorrent] = 1;
   s3allow[s3GetAccelerateConfiguration] = 1;
   s3allow[s3GetBucketAcl] = 1;
+  s3allow[s3GetBucketOwnershipControls] = 1;
   s3allow[s3GetBucketCORS] = 1;
   s3allow[s3GetBucketVersioning] = 1;
   s3allow[s3GetBucketRequestPayment] = 1;
@@ -468,7 +530,7 @@ TEST_F(PolicyTest, Eval3) {
 	    Effect::Allow);
 
 
-  for (auto op = 0ULL; op < s3Count; ++op) {
+  for (auto op = 0ULL; op < s3All; ++op) {
     if ((op == s3ListAllMyBuckets) || (op == s3PutBucketPolicy)) {
       continue;
     }
@@ -527,8 +589,7 @@ TEST_F(PolicyTest, Eval3) {
 TEST_F(PolicyTest, Parse4) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(example4)));
+  ASSERT_NO_THROW(p = Policy(cct.get(), &arbitrary_tenant, example4, true));
   ASSERT_TRUE(p);
 
   EXPECT_EQ(p->text, example4);
@@ -556,8 +617,7 @@ TEST_F(PolicyTest, Parse4) {
 }
 
 TEST_F(PolicyTest, Eval4) {
-  auto p  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(example4));
+  auto p  = Policy(cct.get(), &arbitrary_tenant, example4, true);
   Environment e;
 
   ARN arn1(Partition::aws, Service::iam,
@@ -574,8 +634,7 @@ TEST_F(PolicyTest, Eval4) {
 TEST_F(PolicyTest, Parse5) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(example5)));
+  ASSERT_NO_THROW(p = Policy(cct.get(), &arbitrary_tenant, example5, true));
   ASSERT_TRUE(p);
   EXPECT_EQ(p->text, example5);
   EXPECT_EQ(p->version, Version::v2012_10_17);
@@ -587,7 +646,7 @@ TEST_F(PolicyTest, Parse5) {
   EXPECT_TRUE(p->statements[0].noprinc.empty());
   EXPECT_EQ(p->statements[0].effect, Effect::Allow);
   Action_t act;
-  for (auto i = s3All+1; i <= iamAll; i++)
+  for (auto i = s3objectlambdaAll+1; i <= iamAll; i++)
     act[i] = 1;
   EXPECT_EQ(p->statements[0].action, act);
   EXPECT_EQ(p->statements[0].notaction, None);
@@ -603,8 +662,7 @@ TEST_F(PolicyTest, Parse5) {
 }
 
 TEST_F(PolicyTest, Eval5) {
-  auto p  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(example5));
+  auto p  = Policy(cct.get(), &arbitrary_tenant, example5, true);
   Environment e;
 
   ARN arn1(Partition::aws, Service::iam,
@@ -626,8 +684,7 @@ TEST_F(PolicyTest, Eval5) {
 TEST_F(PolicyTest, Parse6) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(example6)));
+  ASSERT_NO_THROW(p = Policy(cct.get(), &arbitrary_tenant, example6, true));
   ASSERT_TRUE(p);
   EXPECT_EQ(p->text, example6);
   EXPECT_EQ(p->version, Version::v2012_10_17);
@@ -639,7 +696,7 @@ TEST_F(PolicyTest, Parse6) {
   EXPECT_TRUE(p->statements[0].noprinc.empty());
   EXPECT_EQ(p->statements[0].effect, Effect::Allow);
   Action_t act;
-  for (auto i = 0U; i <= stsAll; i++)
+  for (auto i = 0U; i <= organizationsAll; i++)
     act[i] = 1;
   EXPECT_EQ(p->statements[0].action, act);
   EXPECT_EQ(p->statements[0].notaction, None);
@@ -655,8 +712,7 @@ TEST_F(PolicyTest, Parse6) {
 }
 
 TEST_F(PolicyTest, Eval6) {
-  auto p  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(example6));
+  auto p  = Policy(cct.get(), &arbitrary_tenant, example6, true);
   Environment e;
 
   ARN arn1(Partition::aws, Service::iam,
@@ -673,8 +729,7 @@ TEST_F(PolicyTest, Eval6) {
 TEST_F(PolicyTest, Parse7) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(example7)));
+  ASSERT_NO_THROW(p = Policy(cct.get(), &arbitrary_tenant, example7, true));
   ASSERT_TRUE(p);
 
   EXPECT_EQ(p->text, example7);
@@ -698,15 +753,14 @@ TEST_F(PolicyTest, Parse7) {
   EXPECT_EQ(p->statements[0].resource.begin()->resource, "mybucket/*");
   EXPECT_TRUE(p->statements[0].princ.begin()->is_user());
   EXPECT_FALSE(p->statements[0].princ.begin()->is_wildcard());
-  EXPECT_EQ(p->statements[0].princ.begin()->get_tenant(), "");
+  EXPECT_EQ(p->statements[0].princ.begin()->get_account(), "");
   EXPECT_EQ(p->statements[0].princ.begin()->get_id(), "A:subA");
   EXPECT_TRUE(p->statements[0].notresource.empty());
   EXPECT_TRUE(p->statements[0].conditions.empty());
 }
 
 TEST_F(PolicyTest, Eval7) {
-  auto p  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(example7));
+  auto p  = Policy(cct.get(), &arbitrary_tenant, example7, true);
   Environment e;
 
   auto subacct = FakeIdentity(
@@ -730,6 +784,151 @@ TEST_F(PolicyTest, Eval7) {
 		       "", arbitrary_tenant, "mybucket/*");
   EXPECT_EQ(p.eval(e, sub2acct, s3ListBucket, arn3),
 	    Effect::Pass);
+}
+
+
+class ManagedPolicyTest : public ::testing::Test {
+protected:
+  intrusive_ptr<CephContext> cct;
+public:
+  ManagedPolicyTest() {
+    cct.reset(new CephContext(CEPH_ENTITY_TYPE_CLIENT), false);
+  }
+};
+
+TEST_F(ManagedPolicyTest, IAMFullAccess)
+{
+  auto p = get_managed_policy(cct.get(), "arn:aws:iam::aws:policy/IAMFullAccess");
+  ASSERT_TRUE(p);
+
+  Action_t act = iamAllValue | organizationsAllValue;
+  act[iamAll] = 1;
+  act[organizationsAll] = 1;
+  EXPECT_EQ(act, p->statements[0].action);
+}
+
+TEST_F(ManagedPolicyTest, IAMReadOnlyAccess)
+{
+  auto p = get_managed_policy(cct.get(), "arn:aws:iam::aws:policy/IAMReadOnlyAccess");
+  ASSERT_TRUE(p);
+
+  Action_t act;
+  act[iamGenerateCredentialReport] = 1;
+  act[iamGenerateServiceLastAccessedDetails] = 1;
+  act[iamGetUserPolicy] = 1;
+  act[iamGetRole] = 1;
+  act[iamGetRolePolicy] = 1;
+  act[iamGetOIDCProvider] = 1;
+  act[iamGetUser] = 1;
+  act[iamListUserPolicies] = 1;
+  act[iamListAttachedUserPolicies] = 1;
+  act[iamListRoles] = 1;
+  act[iamListRolePolicies] = 1;
+  act[iamListAttachedRolePolicies] = 1;
+  act[iamListOIDCProviders] = 1;
+  act[iamListRoleTags] = 1;
+  act[iamListUsers] = 1;
+  act[iamListAccessKeys] = 1;
+  act[iamGetGroup] = 1;
+  act[iamListGroups] = 1;
+  act[iamListGroupsForUser] = 1;
+  act[iamGetGroupPolicy] = 1;
+  act[iamListGroupPolicies] = 1;
+  act[iamListAttachedGroupPolicies] = 1;
+  act[iamSimulateCustomPolicy] = 1;
+  act[iamSimulatePrincipalPolicy] = 1;
+
+  EXPECT_EQ(act, p->statements[0].action);
+}
+
+TEST_F(ManagedPolicyTest, AmazonSNSFullAccess)
+{
+  auto p = get_managed_policy(cct.get(), "arn:aws:iam::aws:policy/AmazonSNSFullAccess");
+  ASSERT_TRUE(p);
+
+  Action_t act = snsAllValue;
+  act[snsAll] = 1;
+  EXPECT_EQ(act, p->statements[0].action);
+}
+
+TEST_F(ManagedPolicyTest, AmazonSNSReadOnlyAccess)
+{
+  auto p = get_managed_policy(cct.get(), "arn:aws:iam::aws:policy/AmazonSNSReadOnlyAccess");
+  ASSERT_TRUE(p);
+
+  Action_t act;
+  // sns:GetTopicAttributes
+  act[snsGetTopicAttributes] = 1;
+  // sns:List*
+  act[snsListTopics] = 1;
+
+  EXPECT_EQ(act, p->statements[0].action);
+}
+
+TEST_F(ManagedPolicyTest, AmazonS3FullAccess)
+{
+  auto p = get_managed_policy(cct.get(), "arn:aws:iam::aws:policy/AmazonS3FullAccess");
+  ASSERT_TRUE(p);
+
+  Action_t act = s3AllValue | s3objectlambdaAllValue;
+  act[s3All] = 1;
+  act[s3objectlambdaAll] = 1;
+  EXPECT_EQ(act, p->statements[0].action);
+}
+
+TEST_F(ManagedPolicyTest, AmazonS3ReadOnlyAccess)
+{
+  auto p = get_managed_policy(cct.get(), "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess");
+  ASSERT_TRUE(p);
+
+  Action_t act;
+  // s3:Get*
+  act[s3GetObject] = 1;
+  act[s3GetObjectVersion] = 1;
+  act[s3GetObjectAcl] = 1;
+  act[s3GetObjectVersionAcl] = 1;
+  act[s3GetObjectTorrent] = 1;
+  act[s3GetObjectVersionTorrent] = 1;
+  act[s3GetObjectAttributes] = 1;
+  act[s3GetObjectVersionAttributes] = 1;
+  act[s3GetAccelerateConfiguration] = 1;
+  act[s3GetBucketAcl] = 1;
+  act[s3GetBucketOwnershipControls] = 1;
+  act[s3GetBucketCORS] = 1;
+  act[s3GetBucketVersioning] = 1;
+  act[s3GetBucketRequestPayment] = 1;
+  act[s3GetBucketLocation] = 1;
+  act[s3GetBucketPolicy] = 1;
+  act[s3GetBucketNotification] = 1;
+  act[s3GetBucketLogging] = 1;
+  act[s3GetBucketTagging] = 1;
+  act[s3GetBucketWebsite] = 1;
+  act[s3GetLifecycleConfiguration] = 1;
+  act[s3GetReplicationConfiguration] = 1;
+  act[s3GetObjectTagging] = 1;
+  act[s3GetObjectVersionTagging] = 1;
+  act[s3GetBucketObjectLockConfiguration] = 1;
+  act[s3GetObjectRetention] = 1;
+  act[s3GetObjectLegalHold] = 1;
+  act[s3GetBucketPolicyStatus] = 1;
+  act[s3GetPublicAccessBlock] = 1;
+  act[s3GetBucketPublicAccessBlock] = 1;
+  act[s3GetBucketEncryption] = 1;
+  // s3:List*
+  act[s3ListMultipartUploadParts] = 1;
+  act[s3ListBucket] = 1;
+  act[s3ListBucketVersions] = 1;
+  act[s3ListAllMyBuckets] = 1;
+  act[s3ListBucketMultipartUploads] = 1;
+  // s3:Describe*
+  act[s3DescribeJob] = 1;
+  // s3-object-lambda:Get*
+  act[s3objectlambdaGetObject] = 1;
+  // s3-object-lambda:List*
+  act[s3objectlambdaListBucket] = 1;
+  act[s3objectlambdaAll] = 1;
+
+  EXPECT_EQ(act, p->statements[0].action);
 }
 
 const string PolicyTest::arbitrary_tenant = "arbitrary_tenant";
@@ -857,7 +1056,7 @@ protected:
   const rgw::IAM::MaskedIP allowedIPv6Range = { true, rgw::IAM::Address("00100000000000010000110110111000100001011010001100000000000000000000000000000000100010100010111000000011011100000111001100110000"), 124 };
 public:
   IPPolicyTest() {
-    cct = new CephContext(CEPH_ENTITY_TYPE_CLIENT);
+    cct.reset(new CephContext(CEPH_ENTITY_TYPE_CLIENT), false);
   }
 };
 const string IPPolicyTest::arbitrary_tenant = "arbitrary_tenant";
@@ -905,13 +1104,15 @@ TEST_F(IPPolicyTest, asNetworkInvalid) {
 }
 
 TEST_F(IPPolicyTest, IPEnvironment) {
+  RGWProcessEnv penv;
   // Unfortunately RGWCivetWeb is too tightly tied to civetweb to test RGWCivetWeb::init_env.
   RGWEnv rgw_env;
-  rgw::sal::RadosStore store;
+  ceph::async::io_context_pool context_pool(cct->_conf->rgw_thread_pool_size); \
+  rgw::sal::RadosStore store(context_pool);
   std::unique_ptr<rgw::sal::User> user = store.get_user(rgw_user());
   rgw_env.set("REMOTE_ADDR", "192.168.1.1");
   rgw_env.set("HTTP_HOST", "1.2.3.4");
-  req_state rgw_req_state(cct.get(), &rgw_env, 0);
+  req_state rgw_req_state(cct.get(), penv, &rgw_env, 0);
   rgw_req_state.set_user(user);
   rgw_build_iam_environment(&store, &rgw_req_state);
   auto ip = rgw_req_state.env.find("aws:SourceIp");
@@ -951,8 +1152,8 @@ TEST_F(IPPolicyTest, IPEnvironment) {
 TEST_F(IPPolicyTest, ParseIPAddress) {
   boost::optional<Policy> p;
 
-  ASSERT_NO_THROW(p = Policy(cct.get(), arbitrary_tenant,
-			     bufferlist::static_from_string(ip_address_full_example)));
+  ASSERT_NO_THROW(
+    p = Policy(cct.get(), &arbitrary_tenant, ip_address_full_example, true));
   ASSERT_TRUE(p);
 
   EXPECT_EQ(p->text, ip_address_full_example);
@@ -1008,12 +1209,12 @@ TEST_F(IPPolicyTest, ParseIPAddress) {
 }
 
 TEST_F(IPPolicyTest, EvalIPAddress) {
-  auto allowp  = Policy(cct.get(), arbitrary_tenant,
-			bufferlist::static_from_string(ip_address_allow_example));
-  auto denyp  = Policy(cct.get(), arbitrary_tenant,
-		       bufferlist::static_from_string(ip_address_deny_example));
-  auto fullp  = Policy(cct.get(), arbitrary_tenant,
-		   bufferlist::static_from_string(ip_address_full_example));
+  auto allowp =
+    Policy(cct.get(), &arbitrary_tenant, ip_address_allow_example, true);
+  auto denyp =
+    Policy(cct.get(), &arbitrary_tenant, ip_address_deny_example, true);
+  auto fullp =
+    Policy(cct.get(), &arbitrary_tenant, ip_address_full_example, true);
   Environment e;
   Environment allowedIP, blocklistedIP, allowedIPv6, blocklistedIPv6;
   allowedIP.emplace("aws:SourceIp","192.168.1.2");
@@ -1022,7 +1223,7 @@ TEST_F(IPPolicyTest, EvalIPAddress) {
   blocklistedIPv6.emplace("aws:SourceIp", "2001:0db8:85a3:0000:0000:8a2e:0370:7334");
 
   auto trueacct = FakeIdentity(
-    Principal::tenant("ACCOUNT-ID-WITHOUT-HYPHENS"));
+    Principal::account("ACCOUNT-ID-WITHOUT-HYPHENS"));
   // Without an IP address in the environment then evaluation will always pass
   ARN arn1(Partition::aws, Service::s3,
 			    "", arbitrary_tenant, "example_bucket");
@@ -1250,9 +1451,8 @@ TEST(MatchWildcards, Asterisk)
                               "http://example.com/index.html"));
   EXPECT_TRUE(match_wildcards("http://example.com/*/*.jpg",
                               "http://example.com/fun/smiley.jpg"));
-  // note: parsing of * is not greedy, so * does not match 'bc' here
-  EXPECT_FALSE(match_wildcards("a*c", "abcc"));
-  EXPECT_FALSE(match_wildcards("a*c", "abcc", MATCH_CASE_INSENSITIVE));
+  EXPECT_TRUE(match_wildcards("a*c", "abcc"));
+  EXPECT_TRUE(match_wildcards("a*c", "abcc", MATCH_CASE_INSENSITIVE));
 }
 
 TEST(MatchPolicy, Action)
@@ -1300,14 +1500,13 @@ Action_t set_range_bits(std::uint64_t start, std::uint64_t end)
   return result;
 }
 
-using rgw::IAM::s3AllValue;
-using rgw::IAM::stsAllValue;
-using rgw::IAM::allValue;
-using rgw::IAM::iamAllValue;
 TEST(set_cont_bits, iamconsts)
 {
   EXPECT_EQ(s3AllValue, set_range_bits(0, s3All));
-  EXPECT_EQ(iamAllValue, set_range_bits(s3All+1, iamAll));
+  EXPECT_EQ(s3objectlambdaAllValue, set_range_bits(s3All+1, s3objectlambdaAll));
+  EXPECT_EQ(iamAllValue, set_range_bits(s3objectlambdaAll+1, iamAll));
   EXPECT_EQ(stsAllValue, set_range_bits(iamAll+1, stsAll));
+  EXPECT_EQ(snsAllValue, set_range_bits(stsAll+1, snsAll));
+  EXPECT_EQ(organizationsAllValue, set_range_bits(snsAll+1, organizationsAll));
   EXPECT_EQ(allValue , set_range_bits(0, allCount));
 }

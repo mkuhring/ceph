@@ -2,7 +2,7 @@
 
 import logging
 from functools import wraps
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ceph.deployment.service_spec import ServiceSpec
 from orchestrator import DaemonDescription, DeviceLightLoc, HostSpec, \
@@ -10,6 +10,7 @@ from orchestrator import DaemonDescription, DeviceLightLoc, HostSpec, \
     ServiceDescription, raise_if_exception
 
 from .. import mgr
+from ._paginate import ListPaginator
 
 logger = logging.getLogger('orchestrator')
 
@@ -95,11 +96,21 @@ class InventoryManager(ResourceManager):
 
 
 class ServiceManager(ResourceManager):
-    @wait_api_result
     def list(self,
              service_type: Optional[str] = None,
-             service_name: Optional[str] = None) -> List[ServiceDescription]:
-        return self.api.describe_service(service_type, service_name)
+             service_name: Optional[str] = None,
+             offset: int = 0, limit: int = -1,
+             sort: str = '+service_name', search: str = '') -> Tuple[List[Dict[Any, Any]], int]:
+        services = self.api.describe_service(service_type, service_name)
+        services = [service.to_dict() for service in services.result]
+        paginator = ListPaginator(offset, limit, sort, search,
+                                  input_list=services,
+                                  searchable_params=['service_name', 'status.running',
+                                                     'status.last_refreshed', 'status.size'],
+                                  sortable_params=['service_name', 'status.running',
+                                                   'status.last_refreshed', 'status.size'],
+                                  default_sort='+service_name')
+        return list(paginator.list()), paginator.get_count()
 
     @wait_api_result
     def get(self, service_name: str) -> ServiceDescription:
@@ -119,11 +130,9 @@ class ServiceManager(ResourceManager):
             service_ids = [service_ids]
 
         completion_list = [
-            self.api.service_action('reload', service_type, service_name,
-                                    service_id)
-            for service_name, service_id in service_ids
+            self.api.service_action('restart', f'{service_type}.{service_id}')
+            for service_id in service_ids
         ]
-        self.api.orchestrator_wait(completion_list)
         for c in completion_list:
             raise_if_exception(c)
 
@@ -159,6 +168,60 @@ class DaemonManager(ResourceManager):
         return self.api.daemon_action(daemon_name=daemon_name, action=action, image=image)
 
 
+class UpgradeManager(ResourceManager):
+    @wait_api_result
+    def list(self, image: Optional[str], tags: bool,
+             show_all_versions: Optional[bool]) -> Dict[Any, Any]:
+        return self.api.upgrade_ls(image, tags, show_all_versions)
+
+    @wait_api_result
+    def status(self):
+        return self.api.upgrade_status()
+
+    @wait_api_result
+    def start(self, image: str, version: str, daemon_types: Optional[List[str]] = None,
+              host_placement: Optional[str] = None, services: Optional[List[str]] = None,
+              limit: Optional[int] = None) -> str:
+        return self.api.upgrade_start(image, version, daemon_types, host_placement, services,
+                                      limit)
+
+    @wait_api_result
+    def pause(self) -> str:
+        return self.api.upgrade_pause()
+
+    @wait_api_result
+    def resume(self) -> str:
+        return self.api.upgrade_resume()
+
+    @wait_api_result
+    def stop(self) -> str:
+        return self.api.upgrade_stop()
+
+
+class HardwareManager(ResourceManager):
+
+    @wait_api_result
+    def common(self, category: str, hostname: Optional[List[str]] = None) -> str:
+        return self.api.node_proxy_common(category, hostname=hostname)
+
+
+class CertStoreManager(ResourceManager):
+
+    @wait_api_result
+    def get_cert(self, entity: str, service_name: Optional[str] = None,
+                 hostname: Optional[str] = None,
+                 ignore_missing_exception: bool = False) -> str:
+        return self.api.cert_store_get_cert(entity, service_name, hostname,
+                                            no_exception_when_missing=ignore_missing_exception)
+
+    @wait_api_result
+    def get_key(self, entity: str, service_name: Optional[str] = None,
+                hostname: Optional[str] = None,
+                ignore_missing_exception: bool = False) -> str:
+        return self.api.cert_store_get_key(entity, service_name, hostname,
+                                           no_exception_when_missing=ignore_missing_exception)
+
+
 class OrchClient(object):
 
     _instance = None
@@ -178,6 +241,9 @@ class OrchClient(object):
         self.services = ServiceManager(self.api)
         self.osds = OsdManager(self.api)
         self.daemons = DaemonManager(self.api)
+        self.upgrades = UpgradeManager(self.api)
+        self.hardware = HardwareManager(self.api)
+        self.cert_store = CertStoreManager(self.api)
 
     def available(self, features: Optional[List[str]] = None) -> bool:
         available = self.status()['available']
@@ -229,3 +295,10 @@ class OrchFeature(object):
     DEVICE_BLINK_LIGHT = 'blink_device_light'
 
     DAEMON_ACTION = 'daemon_action'
+
+    UPGRADE_LIST = 'upgrade_ls'
+    UPGRADE_STATUS = 'upgrade_status'
+    UPGRADE_START = 'upgrade_start'
+    UPGRADE_PAUSE = 'upgrade_pause'
+    UPGRADE_RESUME = 'upgrade_resume'
+    UPGRADE_STOP = 'upgrade_stop'

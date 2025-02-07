@@ -54,6 +54,14 @@ inline std::ostream& operator<<(std::ostream& os, const delta_op_t op) {
   }
 }
 
+} // namespace crimson::os::seastore::onode
+
+#if FMT_VERSION >= 90000
+template<> struct fmt::formatter<crimson::os::seastore::onode::delta_op_t> : fmt::ostream_formatter {};
+#endif
+
+namespace crimson::os::seastore::onode {
+
 template <value_magic_t MAGIC,
           string_size_t MAX_NS_SIZE,
           string_size_t MAX_OID_SIZE,
@@ -129,7 +137,7 @@ class TestValue final : public Value {
 
     void apply_value_delta(ceph::bufferlist::const_iterator& delta,
                            NodeExtentMutable& payload_mut,
-                           laddr_t value_addr) override {
+                           laddr_offset_t value_addr_offset) override {
       delta_op_t op;
       try {
         ceph::decode(op, delta);
@@ -151,13 +159,13 @@ class TestValue final : public Value {
           break;
         }
         default:
-          logger().error("OTree::TestValue::Replay: got unknown op {} when replay {:#x}+{:#x}",
-                         op, value_addr, payload_mut.get_length());
+          logger().error("OTree::TestValue::Replay: got unknown op {} when replay {}~{:#x}",
+                         op, value_addr_offset, payload_mut.get_length());
           ceph_abort();
         }
       } catch (buffer::error& e) {
-        logger().error("OTree::TestValue::Replay: got decode error {} when replay {:#x}+{:#x}",
-                       e, value_addr, payload_mut.get_length());
+        logger().error("OTree::TestValue::Replay: got decode error {} when replay {}~{:#x}",
+                       e.what(), value_addr_offset, payload_mut.get_length());
         ceph_abort();
       }
     }
@@ -168,7 +176,11 @@ class TestValue final : public Value {
     }
   };
 
-  TestValue(NodeExtentManager& nm, const ValueBuilder& vb, Ref<tree_cursor_t>& p_cursor)
+  TestValue(
+    const hobject_t &hobj,
+    NodeExtentManager& nm,
+    const ValueBuilder& vb,
+    Ref<tree_cursor_t>& p_cursor)
     : Value(nm, vb, p_cursor) {}
   ~TestValue() override = default;
 
@@ -225,3 +237,8 @@ using ExtendedValue  = TestValue<
   value_magic_t::TEST_EXTENDED, 256, 2048, 1200, 8192, 16384, true>;
 
 }
+
+#if FMT_VERSION >= 90000
+template<>
+struct fmt::formatter<crimson::os::seastore::onode::test_item_t> : fmt::ostream_formatter {};
+#endif

@@ -14,6 +14,7 @@
 #include "common/errno.h"
 #include "ReplicatedBackend.h"
 #include "messages/MOSDOp.h"
+#include "messages/MOSDPGPCT.h"
 #include "messages/MOSDRepOp.h"
 #include "messages/MOSDRepOpReply.h"
 #include "messages/MOSDPGPush.h"
@@ -68,12 +69,14 @@ class PG_SendMessageOnConn: public Context {
 class PG_RecoveryQueueAsync : public Context {
   PGBackend::Listener *pg;
   unique_ptr<GenContext<ThreadPool::TPHandle&>> c;
+  uint64_t cost;
   public:
   PG_RecoveryQueueAsync(
     PGBackend::Listener *pg,
-    GenContext<ThreadPool::TPHandle&> *c) : pg(pg), c(c) {}
+    GenContext<ThreadPool::TPHandle&> *c,
+    uint64_t cost) : pg(pg), c(c), cost(cost) {}
   void finish(int) override {
-    pg->schedule_recovery_work(c.release());
+    pg->schedule_recovery_work(c.release(), cost);
   }
 };
 }
@@ -122,7 +125,9 @@ ReplicatedBackend::ReplicatedBackend(
   ObjectStore::CollectionHandle &c,
   ObjectStore *store,
   CephContext *cct) :
-  PGBackend(cct, pg, store, coll, c) {}
+  PGBackend(cct, pg, store, coll, c),
+  pct_callback(this)
+{}
 
 void ReplicatedBackend::run_recovery_op(
   PGBackend::RecoveryHandle *_h,
@@ -190,7 +195,7 @@ void ReplicatedBackend::check_recovery_sources(const OSDMapRef& osdmap)
 
 bool ReplicatedBackend::can_handle_while_inactive(OpRequestRef op)
 {
-  dout(10) << __func__ << ": " << op << dendl;
+  dout(10) << __func__ << ": " << *op->get_req() << dendl;
   switch (op->get_req()->get_type()) {
   case MSG_OSD_PG_PULL:
     return true;
@@ -203,7 +208,7 @@ bool ReplicatedBackend::_handle_message(
   OpRequestRef op
   )
 {
-  dout(10) << __func__ << ": " << op << dendl;
+  dout(10) << __func__ << ": " << *op->get_req() << dendl;
   switch (op->get_req()->get_type()) {
   case MSG_OSD_PG_PUSH:
     do_push(op);
@@ -226,6 +231,10 @@ bool ReplicatedBackend::_handle_message(
     do_repop_reply(op);
     return true;
   }
+
+  case MSG_OSD_PG_PCT:
+    do_pct(op);
+    return true;
 
   default:
     break;
@@ -259,6 +268,7 @@ void ReplicatedBackend::on_change()
   }
   in_progress_ops.clear();
   clear_recovery_state();
+  cancel_pct_update();
 }
 
 int ReplicatedBackend::objects_read_sync(
@@ -273,7 +283,7 @@ int ReplicatedBackend::objects_read_sync(
 
 int ReplicatedBackend::objects_readv_sync(
   const hobject_t &hoid,
-  map<uint64_t, uint64_t>&& m,
+  map<uint64_t, uint64_t>& m,
   uint32_t op_flags,
   bufferlist *bl)
 {
@@ -287,7 +297,7 @@ int ReplicatedBackend::objects_readv_sync(
 
 void ReplicatedBackend::objects_read_async(
   const hobject_t &hoid,
-  const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
+  const list<pair<ECCommon::ec_align_t,
 		  pair<bufferlist*, Context*> > > &to_read,
   Context *on_complete,
   bool fast_read)
@@ -460,13 +470,86 @@ void generate_transaction(
     });
 }
 
+void ReplicatedBackend::do_pct(OpRequestRef op)
+{
+  const MOSDPGPCT *m = static_cast<const MOSDPGPCT*>(op->get_req());
+  dout(10) << __func__ << ": received pct update to "
+	   << m->pg_committed_to << dendl;
+  parent->update_pct(m->pg_committed_to);
+}
+
+void ReplicatedBackend::send_pct_update()
+{
+  dout(10) << __func__ << ": sending pct update" << dendl;
+  ceph_assert(
+    PG_HAVE_FEATURE(parent->get_pg_acting_features(), PCT));
+  for (const auto &i: parent->get_acting_shards()) {
+    if (i == parent->whoami_shard()) continue;
+
+    auto *pct_update = new MOSDPGPCT(
+      spg_t(parent->whoami_spg_t().pgid, i.shard),
+      get_osdmap_epoch(), parent->get_interval_start_epoch(),
+      parent->get_pg_committed_to()
+    );
+
+    dout(10) << __func__ << ": sending pct update to i " << i
+	     << ", i.osd " << i.osd << dendl;
+    parent->send_message_osd_cluster(
+      i.osd, pct_update, get_osdmap_epoch());
+  }
+  dout(10) << __func__ << ": sending pct update complete" << dendl;
+}
+
+void ReplicatedBackend::maybe_kick_pct_update()
+{
+  if (!in_progress_ops.empty()) {
+    dout(20) << __func__ << ": not scheduling pct update, "
+	     << in_progress_ops.size() << " ops pending" << dendl;
+    return;
+  }
+
+  if (!PG_HAVE_FEATURE(parent->get_pg_acting_features(), PCT)) {
+    dout(20) << __func__ << ": not scheduling pct update, PCT feature not"
+	     << " supported" << dendl;
+    return;
+  }
+
+  if (pct_callback.is_scheduled()) {
+    derr << __func__
+	 << ": pct_callback is already scheduled, this should be impossible"
+	 << dendl;
+    return;
+  }
+
+  int64_t pct_delay;
+  if (!parent->get_pool().opts.get(
+	pool_opts_t::PCT_UPDATE_DELAY, &pct_delay)) {
+    dout(20) << __func__ << ": not scheduling pct update, PCT_UPDATE_DELAY not"
+	     << " set" << dendl;
+    return;
+  }
+
+  dout(10) << __func__ << ": scheduling pct update after "
+	   << pct_delay << " seconds" << dendl;
+  parent->get_pg_timer().schedule_after(
+    pct_callback, std::chrono::seconds(pct_delay));
+}
+
+void ReplicatedBackend::cancel_pct_update()
+{
+  if (pct_callback.is_scheduled()) {
+    dout(10) << __func__ << ": canceling pct update" << dendl;
+    parent->get_pg_timer().cancel(pct_callback);
+  }
+}
+
 void ReplicatedBackend::submit_transaction(
   const hobject_t &soid,
   const object_stat_sum_t &delta_stats,
   const eversion_t &at_version,
   PGTransactionUPtr &&_t,
   const eversion_t &trim_to,
-  const eversion_t &min_last_complete_ondisk,
+  const eversion_t &pg_committed_to,
   vector<pg_log_entry_t>&& _log_entries,
   std::optional<pg_hit_set_history_t> &hset_history,
   Context *on_all_commit,
@@ -474,6 +557,8 @@ void ReplicatedBackend::submit_transaction(
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
+  cancel_pct_update();
+
   parent->apply_stats(
     soid,
     delta_stats);
@@ -515,7 +600,7 @@ void ReplicatedBackend::submit_transaction(
     tid,
     reqid,
     trim_to,
-    min_last_complete_ondisk,
+    pg_committed_to,
     added.size() ? *(added.begin()) : hobject_t(),
     removed.size() ? *(removed.begin()) : hobject_t(),
     log_entries,
@@ -531,7 +616,7 @@ void ReplicatedBackend::submit_transaction(
     hset_history,
     trim_to,
     at_version,
-    min_last_complete_ondisk,
+    pg_committed_to,
     true,
     op_t);
   
@@ -570,6 +655,7 @@ void ReplicatedBackend::op_commit(const ceph::ref_t<InProgressOp>& op)
     op->on_commit = 0;
     in_progress_ops.erase(op->tid);
   }
+  maybe_kick_pct_update();
 }
 
 void ReplicatedBackend::do_repop_reply(OpRequestRef op)
@@ -626,6 +712,7 @@ void ReplicatedBackend::do_repop_reply(OpRequestRef op)
       in_progress_ops.erase(iter);
     }
   }
+  maybe_kick_pct_update();
 }
 
 int ReplicatedBackend::be_deep_scrub(
@@ -653,13 +740,15 @@ int ReplicatedBackend::be_deep_scrub(
       pos.data_hash = bufferhash(-1);
     }
 
+    const uint64_t stride = cct->_conf->osd_deep_scrub_stride;
+
     bufferlist bl;
     r = store->read(
       ch,
       ghobject_t(
 	poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
       pos.data_pos,
-      cct->_conf->osd_deep_scrub_stride, bl,
+      stride, bl,
       fadvise_flags);
     if (r < 0) {
       dout(20) << __func__ << "  " << poid << " got "
@@ -671,7 +760,7 @@ int ReplicatedBackend::be_deep_scrub(
       pos.data_hash << bl;
     }
     pos.data_pos += r;
-    if (static_cast<uint64_t>(r) == cct->_conf->osd_deep_scrub_stride) {
+    if (static_cast<uint64_t>(r) == stride) {
       dout(20) << __func__ << "  " << poid << " more data, digest so far 0x"
 	       << std::hex << pos.data_hash.digest() << std::dec << dendl;
       return -EINPROGRESS;
@@ -815,8 +904,11 @@ struct C_ReplicatedBackend_OnPullComplete : GenContext<ThreadPool::TPHandle&> {
   ReplicatedBackend *bc;
   list<ReplicatedBackend::pull_complete_info> to_continue;
   int priority;
-  C_ReplicatedBackend_OnPullComplete(ReplicatedBackend *bc, int priority)
-    : bc(bc), priority(priority) {}
+  C_ReplicatedBackend_OnPullComplete(
+    ReplicatedBackend *bc,
+    int priority,
+    list<ReplicatedBackend::pull_complete_info> &&to_continue)
+    : bc(bc), to_continue(std::move(to_continue)), priority(priority) {}
 
   void finish(ThreadPool::TPHandle &handle) override {
     ReplicatedBackend::RPGHandle *h = bc->_open_recovery_op();
@@ -838,6 +930,15 @@ struct C_ReplicatedBackend_OnPullComplete : GenContext<ThreadPool::TPHandle&> {
       handle.reset_tp_timeout();
     }
     bc->run_recovery_op(h, priority);
+  }
+
+  /// Estimate total data reads required to perform pushes
+  uint64_t estimate_push_costs() const {
+    uint64_t cost = 0;
+    for (const auto &i: to_continue) {
+      cost += i.stat.num_bytes_recovered;
+    }
+    return cost;
   }
 };
 
@@ -868,12 +969,13 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
     C_ReplicatedBackend_OnPullComplete *c =
       new C_ReplicatedBackend_OnPullComplete(
 	this,
-	m->get_priority());
-    c->to_continue.swap(to_continue);
+	m->get_priority(),
+	std::move(to_continue));
     t.register_on_complete(
       new PG_RecoveryQueueAsync(
 	get_parent(),
-	get_parent()->bless_unlocked_gencontext(c)));
+	get_parent()->bless_unlocked_gencontext(c),
+        std::max<uint64_t>(1, c->estimate_push_costs())));
   }
   replies.erase(replies.end() - 1);
 
@@ -936,7 +1038,7 @@ Message * ReplicatedBackend::generate_subop(
   ceph_tid_t tid,
   osd_reqid_t reqid,
   eversion_t pg_trim_to,
-  eversion_t min_last_complete_ondisk,
+  eversion_t pg_committed_to,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
   const bufferlist &log_entries,
@@ -973,13 +1075,9 @@ Message * ReplicatedBackend::generate_subop(
 
   wr->pg_trim_to = pg_trim_to;
 
-  if (HAVE_FEATURE(parent->min_peer_features(), OSD_REPOP_MLCOD)) {
-    wr->min_last_complete_ondisk = min_last_complete_ondisk;
-  } else {
-    /* Some replicas need this field to be at_version.  New replicas
-     * will ignore it */
-    wr->set_rollback_to(at_version);
-  }
+  // this feature is from 2019 (6f12bf27cb91), assume present
+  ceph_assert(HAVE_FEATURE(parent->min_peer_features(), OSD_REPOP_MLCOD));
+  wr->pg_committed_to = pg_committed_to;
 
   wr->new_temp_oid = new_temp_oid;
   wr->discard_temp_oid = discard_temp_oid;
@@ -993,7 +1091,7 @@ void ReplicatedBackend::issue_op(
   ceph_tid_t tid,
   osd_reqid_t reqid,
   eversion_t pg_trim_to,
-  eversion_t min_last_complete_ondisk,
+  eversion_t pg_committed_to,
   hobject_t new_temp_oid,
   hobject_t discard_temp_oid,
   const vector<pg_log_entry_t> &log_entries,
@@ -1026,7 +1124,7 @@ void ReplicatedBackend::issue_op(
 	  tid,
 	  reqid,
 	  pg_trim_to,
-	  min_last_complete_ondisk,
+	  pg_committed_to,
 	  new_temp_oid,
 	  discard_temp_oid,
 	  logs,
@@ -1128,7 +1226,7 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
     m->updated_hit_set_history,
     m->pg_trim_to,
     m->version, /* Replicated PGs don't have rollback info */
-    m->min_last_complete_ondisk,
+    m->pg_committed_to,
     update_snaps,
     rm->localt,
     async);
@@ -1450,14 +1548,14 @@ void ReplicatedBackend::prepare_pull(
 
   ceph_assert(!pulling.count(soid));
   pull_from_peer[fromshard].insert(soid);
-  PullInfo &pi = pulling[soid];
-  pi.from = fromshard;
-  pi.soid = soid;
-  pi.head_ctx = headctx;
-  pi.recovery_info = op.recovery_info;
-  pi.recovery_progress = op.recovery_progress;
-  pi.cache_dont_need = h->cache_dont_need;
-  pi.lock_manager = std::move(lock_manager);
+  pull_info_t &pull_info = pulling[soid];
+  pull_info.from = fromshard;
+  pull_info.soid = soid;
+  pull_info.head_ctx = headctx;
+  pull_info.recovery_info = op.recovery_info;
+  pull_info.recovery_progress = op.recovery_progress;
+  pull_info.cache_dont_need = h->cache_dont_need;
+  pull_info.lock_manager = std::move(lock_manager);
 }
 
 /*
@@ -1561,28 +1659,28 @@ int ReplicatedBackend::prep_push(
   const auto missing_iter = pmissing_iter->second.get_items().find(soid);
   assert(missing_iter != pmissing_iter->second.get_items().end());
   // take note.
-  PushInfo &pi = pushing[soid][peer];
-  pi.obc = obc;
-  pi.recovery_info.size = obc->obs.oi.size;
-  pi.recovery_info.copy_subset = data_subset;
-  pi.recovery_info.clone_subset = clone_subsets;
-  pi.recovery_info.soid = soid;
-  pi.recovery_info.oi = obc->obs.oi;
-  pi.recovery_info.ss = pop->recovery_info.ss;
-  pi.recovery_info.version = version;
-  pi.recovery_info.object_exist = missing_iter->second.clean_regions.object_is_exist();
-  pi.recovery_progress.omap_complete = !missing_iter->second.clean_regions.omap_is_dirty();
-  pi.lock_manager = std::move(lock_manager);
+  push_info_t &push_info = pushing[soid][peer];
+  push_info.obc = obc;
+  push_info.recovery_info.size = obc->obs.oi.size;
+  push_info.recovery_info.copy_subset = data_subset;
+  push_info.recovery_info.clone_subset = clone_subsets;
+  push_info.recovery_info.soid = soid;
+  push_info.recovery_info.oi = obc->obs.oi;
+  push_info.recovery_info.ss = pop->recovery_info.ss;
+  push_info.recovery_info.version = version;
+  push_info.recovery_info.object_exist = missing_iter->second.clean_regions.object_is_exist();
+  push_info.recovery_progress.omap_complete = !missing_iter->second.clean_regions.omap_is_dirty();
+  push_info.lock_manager = std::move(lock_manager);
 
   ObjectRecoveryProgress new_progress;
-  int r = build_push_op(pi.recovery_info,
-			pi.recovery_progress,
+  int r = build_push_op(push_info.recovery_info,
+			push_info.recovery_progress,
 			&new_progress,
 			pop,
-			&(pi.stat), cache_dont_need);
+			&(push_info.stat), cache_dont_need);
   if (r < 0)
     return r;
-  pi.recovery_progress = new_progress;
+  push_info.recovery_progress = new_progress;
   return 0;
 }
 
@@ -1798,18 +1896,18 @@ bool ReplicatedBackend::handle_pull_response(
     return false;
   }
 
-  PullInfo &pi = piter->second;
-  if (pi.recovery_info.size == (uint64_t(-1))) {
-    pi.recovery_info.size = pop.recovery_info.size;
-    pi.recovery_info.copy_subset.intersection_of(
+  pull_info_t &pull_info = piter->second;
+  if (pull_info.recovery_info.size == (uint64_t(-1))) {
+    pull_info.recovery_info.size = pop.recovery_info.size;
+    pull_info.recovery_info.copy_subset.intersection_of(
       pop.recovery_info.copy_subset);
   }
   // If primary doesn't have object info and didn't know version
-  if (pi.recovery_info.version == eversion_t()) {
-    pi.recovery_info.version = pop.version;
+  if (pull_info.recovery_info.version == eversion_t()) {
+    pull_info.recovery_info.version = pop.version;
   }
 
-  bool first = pi.recovery_progress.first;
+  bool first = pull_info.recovery_progress.first;
   if (first) {
     // attrs only reference the origin bufferlist (decode from
     // MOSDPGPush message) whose size is much greater than attrs in
@@ -1821,23 +1919,23 @@ bool ReplicatedBackend::handle_pull_response(
     for (auto& a : attrset) {
       a.second.rebuild();
     }
-    pi.obc = get_parent()->get_obc(pi.recovery_info.soid, attrset);
+    pull_info.obc = get_parent()->get_obc(pull_info.recovery_info.soid, attrset);
     if (attrset.find(SS_ATTR) != attrset.end()) {
       bufferlist ssbv = attrset.at(SS_ATTR);
       SnapSet ss(ssbv);
-      assert(!pi.obc->ssc->exists || ss.seq  == pi.obc->ssc->snapset.seq);
+      assert(!pull_info.obc->ssc->exists || ss.seq  == pull_info.obc->ssc->snapset.seq);
     }
-    pi.recovery_info.oi = pi.obc->obs.oi;
-    pi.recovery_info = recalc_subsets(
-      pi.recovery_info,
-      pi.obc->ssc,
-      pi.lock_manager);
+    pull_info.recovery_info.oi = pull_info.obc->obs.oi;
+    pull_info.recovery_info = recalc_subsets(
+      pull_info.recovery_info,
+      pull_info.obc->ssc,
+      pull_info.lock_manager);
   }
 
 
   interval_set<uint64_t> usable_intervals;
   bufferlist usable_data;
-  trim_pushed_data(pi.recovery_info.copy_subset,
+  trim_pushed_data(pull_info.recovery_info.copy_subset,
 		   data_included,
 		   data,
 		   &usable_intervals,
@@ -1846,24 +1944,24 @@ bool ReplicatedBackend::handle_pull_response(
   data = std::move(usable_data);
 
 
-  pi.recovery_progress = pop.after_progress;
+  pull_info.recovery_progress = pop.after_progress;
 
-  dout(10) << "new recovery_info " << pi.recovery_info
-           << ", new progress " << pi.recovery_progress
+  dout(10) << "new recovery_info " << pull_info.recovery_info
+           << ", new progress " << pull_info.recovery_progress
            << dendl;
   interval_set<uint64_t> data_zeros;
   uint64_t z_offset = pop.before_progress.data_recovered_to;
   uint64_t z_length = pop.after_progress.data_recovered_to - pop.before_progress.data_recovered_to;
   if (z_length)
     data_zeros.insert(z_offset, z_length);
-  bool complete = pi.is_complete();
+  bool complete = pull_info.is_complete();
   bool clear_omap = !pop.before_progress.omap_complete;
 
-  submit_push_data(pi.recovery_info,
+  submit_push_data(pull_info.recovery_info,
                   first,
                   complete,
                   clear_omap,
-                  pi.cache_dont_need,
+                  pull_info.cache_dont_need,
                   data_zeros,
                   data_included,
                   data,
@@ -1872,26 +1970,26 @@ bool ReplicatedBackend::handle_pull_response(
                   pop.omap_entries,
                   t);
 
-  pi.stat.num_keys_recovered += pop.omap_entries.size();
-  pi.stat.num_bytes_recovered += data.length();
+  pull_info.stat.num_keys_recovered += pop.omap_entries.size();
+  pull_info.stat.num_bytes_recovered += data.length();
   get_parent()->get_logger()->inc(l_osd_rbytes, pop.omap_entries.size() + data.length());
 
   if (complete) {
-    pi.stat.num_objects_recovered++;
+    pull_info.stat.num_objects_recovered++;
     // XXX: This could overcount if regular recovery is needed right after a repair
     if (get_parent()->pg_is_repair()) {
-      pi.stat.num_objects_repaired++;
+      pull_info.stat.num_objects_repaired++;
       get_parent()->inc_osd_stat_repaired();
     }
     clear_pull_from(piter);
-    to_continue->push_back({hoid, pi.stat});
+    to_continue->push_back({hoid, pull_info.stat});
     get_parent()->on_local_recover(
-      hoid, pi.recovery_info, pi.obc, false, t);
+      hoid, pull_info.recovery_info, pull_info.obc, false, t);
     return false;
   } else {
     response->soid = pop.soid;
-    response->recovery_info = pi.recovery_info;
-    response->recovery_progress = pi.recovery_progress;
+    response->recovery_info = pull_info.recovery_info;
+    response->recovery_progress = pull_info.recovery_progress;
     return true;
   }
 }
@@ -2203,18 +2301,18 @@ bool ReplicatedBackend::handle_push_reply(
 	     << dendl;
     return false;
   } else {
-    PushInfo *pi = &pushing[soid][peer];
+    push_info_t *push_info = &pushing[soid][peer];
     bool error = pushing[soid].begin()->second.recovery_progress.error;
 
-    if (!pi->recovery_progress.data_complete && !error) {
+    if (!push_info->recovery_progress.data_complete && !error) {
       dout(10) << " pushing more from, "
-	       << pi->recovery_progress.data_recovered_to
-	       << " of " << pi->recovery_info.copy_subset << dendl;
+	       << push_info->recovery_progress.data_recovered_to
+	       << " of " << push_info->recovery_info.copy_subset << dendl;
       ObjectRecoveryProgress new_progress;
       int r = build_push_op(
-	pi->recovery_info,
-	pi->recovery_progress, &new_progress, reply,
-	&(pi->stat));
+	push_info->recovery_info,
+	push_info->recovery_progress, &new_progress, reply,
+	&(push_info->stat));
       // Handle the case of a read error right after we wrote, which is
       // hopefully extremely rare.
       if (r < 0) {
@@ -2223,19 +2321,19 @@ bool ReplicatedBackend::handle_push_reply(
 	error = true;
 	goto done;
       }
-      pi->recovery_progress = new_progress;
+      push_info->recovery_progress = new_progress;
       return true;
     } else {
       // done!
 done:
       if (!error)
-	get_parent()->on_peer_recover( peer, soid, pi->recovery_info);
+	get_parent()->on_peer_recover( peer, soid, push_info->recovery_info);
 
-      get_parent()->release_locks(pi->lock_manager);
-      object_stat_sum_t stat = pi->stat;
-      eversion_t v = pi->recovery_info.version;
+      get_parent()->release_locks(push_info->lock_manager);
+      object_stat_sum_t stat = push_info->stat;
+      eversion_t v = push_info->recovery_info.version;
       pushing[soid].erase(peer);
-      pi = NULL;
+      push_info = nullptr;
 
       if (pushing[soid].empty()) {
 	if (!error)
@@ -2349,7 +2447,7 @@ void ReplicatedBackend::_failed_pull(pg_shard_t from, const hobject_t &soid)
 }
 
 void ReplicatedBackend::clear_pull_from(
-  map<hobject_t, PullInfo>::iterator piter)
+  map<hobject_t, pull_info_t>::iterator piter)
 {
   auto from = piter->second.from;
   pull_from_peer[from].erase(piter->second.soid);
@@ -2358,7 +2456,7 @@ void ReplicatedBackend::clear_pull_from(
 }
 
 void ReplicatedBackend::clear_pull(
-  map<hobject_t, PullInfo>::iterator piter,
+  map<hobject_t, pull_info_t>::iterator piter,
   bool clear_pull_from_peer)
 {
   if (clear_pull_from_peer) {

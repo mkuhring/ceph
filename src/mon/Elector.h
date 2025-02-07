@@ -188,7 +188,7 @@ class Elector : public ElectionOwner, RankProvider {
    * Send a ping to the specified peer.
    * @n optional time that we will use instead of calling ceph_clock_now()
    */
-  void send_peer_ping(int peer, const utime_t *n=NULL);
+  bool send_peer_ping(int peer, const utime_t *n=NULL);
   /**
    * Check the state of pinging the specified peer. This is our
    * "tick" for heartbeating; scheduled by itself and begin_peer_ping().
@@ -244,6 +244,19 @@ class Elector : public ElectionOwner, RankProvider {
   /* Right now we don't disallow anybody */
   std::set<int> disallowed_leaders;
   const std::set<int>& get_disallowed_leaders() const { return disallowed_leaders; }
+  /**
+   * Check if the monitor is the tiebreaker in a stretch cluster.
+   *
+   * @returns true if the Monitor is the tiebreaker, false otherwise.
+   */
+  bool is_tiebreaker(int rank) const;
+  /**
+   * Check if the mon is marked dwon in stretch mode.
+   *
+   * @returns true if the monitor is marked down in stretch mode,
+   * otherwise return false.
+   */
+  bool is_stretch_marked_down_mons(int from) const;
   /**
    * Reset the expire_event timer so we can limit the amount of time we 
    * will be electing. Clean up our peer_info.
@@ -358,6 +371,11 @@ class Elector : public ElectionOwner, RankProvider {
    */
   void start_participating();
   /**
+  * Check if our peer_tracker is self-consistent, not suffering from
+  * https://tracker.ceph.com/issues/58049
+  */
+  bool peer_tracker_is_clean();
+  /**
    * Forget everything about our peers. :(
    */
   void notify_clear_peer_state();
@@ -371,7 +389,7 @@ class Elector : public ElectionOwner, RankProvider {
    * This is safe to call even if we haven't joined or are currently
    * in a quorum.
    */
-  void notify_rank_removed(unsigned rank_removed);
+  void notify_rank_removed(unsigned rank_removed, unsigned new_rank);
   void notify_strategy_maybe_changed(int strategy);
   /**
    * Set the disallowed leaders.

@@ -2,30 +2,7 @@
 Upgrading Ceph
 ==============
 
-.. DANGER:: DATE: 01 NOV 2021. 
-
-   DO NOT UPGRADE TO CEPH PACIFIC FROM AN OLDER VERSION.  
-
-   A recently-discovered bug (https://tracker.ceph.com/issues/53062) can cause
-   data corruption. This bug occurs during OMAP format conversion for
-   clusters that are updated to Pacific. New clusters are not affected by this
-   bug.
-
-   The trigger for this bug is BlueStore's repair/quick-fix functionality. This
-   bug can be triggered in two known ways: 
-
-    (1) manually via the ceph-bluestore-tool, or 
-    (2) automatically, by OSD if ``bluestore_fsck_quick_fix_on_mount`` is set 
-        to true.
-
-   The fix for this bug is expected to be available in Ceph v16.2.7.
-
-   DO NOT set ``bluestore_quick_fix_on_mount`` to true. If it is currently
-   set to true in your configuration, immediately set it to false.
-
-   DO NOT run ``ceph-bluestore-tool``'s repair/quick-fix commands.
-
-Cephadm can safely upgrade Ceph from one bugfix release to the next.  For
+Cephadm can safely upgrade Ceph from one point release to the next.  For
 example, you can upgrade from v15.2.0 (the first Octopus release) to the next
 point release, v15.2.1.
 
@@ -48,19 +25,44 @@ The automated upgrade process follows Ceph best practices.  For example:
 Starting the upgrade
 ====================
 
+.. note::
+   .. note::
+      `Staggered Upgrade`_ of the mons/mgrs may be necessary to have access
+      to this new feature.
+
+   Cephadm by default reduces `max_mds` to `1`. This can be disruptive for large
+   scale CephFS deployments because the cluster cannot quickly reduce active MDS(s)
+   to `1` and a single active MDS cannot easily handle the load of all clients
+   even for a short time. Therefore, to upgrade MDS(s) without reducing `max_mds`,
+   the `fail_fs` option can to be set to `true` (default value is `false`) prior
+   to initiating the upgrade:
+
+   .. prompt:: bash #
+
+      ceph config set mgr mgr/orchestrator/fail_fs true
+
+   This would:
+               #. Fail CephFS filesystems, bringing active MDS daemon(s) to
+                  `up:standby` state.
+
+               #. Upgrade MDS daemons safely.
+
+               #. Bring CephFS filesystems back up, bringing the state of active
+                  MDS daemon(s) from `up:standby` to `up:active`.
+
 Before you use cephadm to upgrade Ceph, verify that all hosts are currently online and that your cluster is healthy by running the following command:
 
 .. prompt:: bash #
 
    ceph -s
 
-To upgrade (or downgrade) to a specific release, run the following command:
+To upgrade to a specific release, run a command of the following form:
 
 .. prompt:: bash #
 
   ceph orch upgrade start --ceph-version <version>
 
-For example, to upgrade to v16.2.6, run the following command:
+For example, to upgrade to v16.2.6, run a command of the following form:
 
 .. prompt:: bash #
 
@@ -129,31 +131,45 @@ doesn't use ``cephadm shell``) to a version compatible with the new version.
 Potential problems
 ==================
 
-There are a few health alerts that can arise during the upgrade process.
+
+Error: ENOENT: Module not found
+-------------------------------
+
+The message ``Error ENOENT: Module not found`` appears in response to the command ``ceph orch upgrade status`` if the orchestrator has crashed:
+
+.. prompt:: bash #
+
+   ceph orch upgrade status
+
+::
+
+   Error ENOENT: Module not found
+
+This is possibly caused by invalid JSON in a mgr config-key. See `Redmine tracker Issue #67329 <https://tracker.ceph.com/issues/67329>`_ and `the discussion on the [ceph-users] mailing list <https://www.spinics.net/lists/ceph-users/msg83667.html>`_.
 
 UPGRADE_NO_STANDBY_MGR
 ----------------------
 
 This alert (``UPGRADE_NO_STANDBY_MGR``) means that Ceph does not detect an
-active standby manager daemon. In order to proceed with the upgrade, Ceph
-requires an active standby manager daemon (which you can think of in this
+active standby Manager daemon. In order to proceed with the upgrade, Ceph
+requires an active standby Manager daemon (which you can think of in this
 context as "a second manager").
 
-You can ensure that Cephadm is configured to run 2 (or more) managers by
+You can ensure that Cephadm is configured to run two (or more) Managers by
 running the following command:
 
 .. prompt:: bash #
 
   ceph orch apply mgr 2  # or more
 
-You can check the status of existing mgr daemons by running the following
+You can check the status of existing Manager daemons by running the following
 command:
 
 .. prompt:: bash #
 
   ceph orch ps --daemon-type mgr
 
-If an existing mgr daemon has stopped, you can try to restart it by running the
+If an existing Manager daemon has stopped, you can try to restart it by running the
 following command: 
 
 .. prompt:: bash #
@@ -181,7 +197,7 @@ Using customized container images
 =================================
 
 For most users, upgrading requires nothing more complicated than specifying the
-Ceph version number to upgrade to.  In such cases, cephadm locates the specific
+Ceph version to which to upgrade.  In such cases, cephadm locates the specific
 Ceph container image to use by combining the ``container_image_base``
 configuration option (default: ``docker.io/ceph/ceph``) with a tag of
 ``vX.Y.Z``.
@@ -191,7 +207,7 @@ you need. For example, the following command upgrades to a development build:
 
 .. prompt:: bash #
 
-  ceph orch upgrade start --image quay.io/ceph-ci/ceph:recent-git-branch-name
+  ceph orch upgrade start --image quay.ceph.io/ceph-ci/ceph:recent-git-branch-name
 
 For more information about available container images, see :ref:`containers`.
 
@@ -199,7 +215,7 @@ Staggered Upgrade
 =================
 
 Some users may prefer to upgrade components in phases rather than all at once.
-The upgrade command, starting in 16.2.10 and 17.2.1 allows parameters
+The upgrade command, starting in 16.2.11 and 17.2.1 allows parameters
 to limit which daemons are upgraded by a single upgrade command. The options in
 include ``daemon_types``, ``services``, ``hosts`` and ``limit``. ``daemon_types``
 takes a comma-separated list of daemon types and will only upgrade daemons of those
@@ -291,3 +307,19 @@ upgrading:
 
 You should now have all your Manager daemons on the new version and be able to
 specify the limiting parameters for the rest of the upgrade.
+
+
+Updating a non-Ceph image service with custom image
+====================================================
+
+To update a non-Ceph image service, run a command of the following form:
+
+.. prompt:: bash #
+
+  ceph orch update service <service_type> <image>
+
+For example:
+
+.. prompt:: bash #
+
+  ceph orch update service prometheus quay.io/prometheus/prometheus:v2.55.1

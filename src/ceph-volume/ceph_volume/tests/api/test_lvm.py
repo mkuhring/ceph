@@ -69,7 +69,7 @@ class TestVolumeGroupFree(object):
 
 class TestCreateLVs(object):
 
-    def setup(self):
+    def setup_method(self):
         self.vg = api.VolumeGroup(vg_name='ceph',
                                          vg_extent_size=1073741824,
                                          vg_extent_count=99999999,
@@ -107,10 +107,10 @@ class TestCreateLVs(object):
 
 class TestVolumeGroupSizing(object):
 
-    def setup(self):
+    def setup_method(self):
         self.vg = api.VolumeGroup(vg_name='ceph',
-                                         vg_extent_size=1073741824,
-                                         vg_free_count=1024)
+                                  vg_extent_size=1073741824,
+                                  vg_free_count=1024)
 
     def test_parts_and_size_errors(self):
         with pytest.raises(ValueError) as error:
@@ -182,7 +182,7 @@ class TestRemoveLV(object):
 
 class TestCreateLV(object):
 
-    def setup(self):
+    def setup_method(self):
         self.foo_volume = api.Volume(lv_name='foo', lv_path='/path', vg_name='foo_group', lv_tags='')
         self.foo_group = api.VolumeGroup(vg_name='foo_group',
                                          vg_extent_size="4194304",
@@ -194,8 +194,8 @@ class TestCreateLV(object):
     @patch('ceph_volume.api.lvm.get_single_lv')
     def test_uses_size(self, m_get_single_lv, m_call, m_run, monkeypatch):
         m_get_single_lv.return_value = self.foo_volume
-        api.create_lv('foo', 0, vg=self.foo_group, size=419430400, tags={'ceph.type': 'data'})
-        expected = (['lvcreate', '--yes', '-l', '100', '-n', 'foo-0', 'foo_group'])
+        api.create_lv('foo', '1234-abcd', vg=self.foo_group, size=419430400, tags={'ceph.type': 'data'})
+        expected = (['lvcreate', '--yes', '-l', '100', '-n', 'foo-1234-abcd', 'foo_group'])
         m_run.assert_called_with(expected, run_on_host=True)
 
     @patch('ceph_volume.api.lvm.process.run')
@@ -209,8 +209,8 @@ class TestCreateLV(object):
                                     vg_free_count="1000")
         m_get_single_lv.return_value = foo_volume
         # 423624704 should be just under 1% off of the available size 419430400
-        api.create_lv('foo', 0, vg=foo_group, size=4232052736, tags={'ceph.type': 'data'})
-        expected = ['lvcreate', '--yes', '-l', '1000', '-n', 'foo-0', 'foo_group']
+        api.create_lv('foo', '1234-abcd', vg=foo_group, size=4232052736, tags={'ceph.type': 'data'})
+        expected = ['lvcreate', '--yes', '-l', '1000', '-n', 'foo-1234-abcd', 'foo_group']
         m_run.assert_called_with(expected, run_on_host=True)
 
     @patch('ceph_volume.api.lvm.process.run')
@@ -219,15 +219,15 @@ class TestCreateLV(object):
     def test_uses_size_too_large(self, m_get_single_lv, m_call, m_run, monkeypatch):
         m_get_single_lv.return_value = self.foo_volume
         with pytest.raises(RuntimeError):
-            api.create_lv('foo', 0, vg=self.foo_group, size=5368709120, tags={'ceph.type': 'data'})
+            api.create_lv('foo', '1234-abcd', vg=self.foo_group, size=5368709120, tags={'ceph.type': 'data'})
 
     @patch('ceph_volume.api.lvm.process.run')
     @patch('ceph_volume.api.lvm.process.call')
     @patch('ceph_volume.api.lvm.get_single_lv')
     def test_uses_extents(self, m_get_single_lv, m_call, m_run, monkeypatch):
         m_get_single_lv.return_value = self.foo_volume
-        api.create_lv('foo', 0, vg=self.foo_group, extents='50', tags={'ceph.type': 'data'})
-        expected = ['lvcreate', '--yes', '-l', '50', '-n', 'foo-0', 'foo_group']
+        api.create_lv('foo', '1234-abcd', vg=self.foo_group, extents='50', tags={'ceph.type': 'data'})
+        expected = ['lvcreate', '--yes', '-l', '50', '-n', 'foo-1234-abcd', 'foo_group']
         m_run.assert_called_with(expected, run_on_host=True)
 
     @pytest.mark.parametrize("test_input,expected",
@@ -238,8 +238,8 @@ class TestCreateLV(object):
     @patch('ceph_volume.api.lvm.get_single_lv')
     def test_uses_slots(self, m_get_single_lv, m_call, m_run, monkeypatch, test_input, expected):
         m_get_single_lv.return_value = self.foo_volume
-        api.create_lv('foo', 0, vg=self.foo_group, slots=test_input, tags={'ceph.type': 'data'})
-        expected = ['lvcreate', '--yes', '-l', str(expected), '-n', 'foo-0', 'foo_group']
+        api.create_lv('foo', '1234-abcd', vg=self.foo_group, slots=test_input, tags={'ceph.type': 'data'})
+        expected = ['lvcreate', '--yes', '-l', str(expected), '-n', 'foo-1234-abcd', 'foo_group']
         m_run.assert_called_with(expected, run_on_host=True)
 
     @patch('ceph_volume.api.lvm.process.run')
@@ -247,8 +247,8 @@ class TestCreateLV(object):
     @patch('ceph_volume.api.lvm.get_single_lv')
     def test_uses_all(self, m_get_single_lv, m_call, m_run, monkeypatch):
         m_get_single_lv.return_value = self.foo_volume
-        api.create_lv('foo', 0, vg=self.foo_group, tags={'ceph.type': 'data'})
-        expected = ['lvcreate', '--yes', '-l', '100%FREE', '-n', 'foo-0', 'foo_group']
+        api.create_lv('foo', '1234-abcd', vg=self.foo_group, tags={'ceph.type': 'data'})
+        expected = ['lvcreate', '--yes', '-l', '100%FREE', '-n', 'foo-1234-abcd', 'foo_group']
         m_run.assert_called_with(expected, run_on_host=True)
 
     @patch('ceph_volume.api.lvm.process.run')
@@ -257,7 +257,7 @@ class TestCreateLV(object):
     @patch('ceph_volume.api.lvm.get_single_lv')
     def test_calls_to_set_tags_default(self, m_get_single_lv, m_set_tags, m_call, m_run, monkeypatch):
         m_get_single_lv.return_value = self.foo_volume
-        api.create_lv('foo', 0, vg=self.foo_group)
+        api.create_lv('foo', '1234-abcd', vg=self.foo_group)
         tags = {
             "ceph.osd_id": "null",
             "ceph.type": "null",
@@ -272,7 +272,7 @@ class TestCreateLV(object):
     @patch('ceph_volume.api.lvm.get_single_lv')
     def test_calls_to_set_tags_arg(self, m_get_single_lv, m_set_tags, m_call, m_run, monkeypatch):
         m_get_single_lv.return_value = self.foo_volume
-        api.create_lv('foo', 0, vg=self.foo_group, tags={'ceph.type': 'data'})
+        api.create_lv('foo', '1234-abcd', vg=self.foo_group, tags={'ceph.type': 'data'})
         tags = {
             "ceph.type": "data",
             "ceph.data_device": "/path"
@@ -288,13 +288,13 @@ class TestCreateLV(object):
                        m_run, monkeypatch):
         m_get_single_lv.return_value = self.foo_volume
         m_get_device_vgs.return_value = []
-        api.create_lv('foo', 0, device='dev/foo', size='5G', tags={'ceph.type': 'data'})
+        api.create_lv('foo', '1234-abcd', device='dev/foo', size='5G', tags={'ceph.type': 'data'})
         m_create_vg.assert_called_with('dev/foo', name_prefix='ceph')
 
 
 class TestTags(object):
 
-    def setup(self):
+    def setup_method(self):
         self.foo_volume_clean = api.Volume(lv_name='foo_clean', lv_path='/pathclean',
             vg_name='foo_group',
             lv_tags='')
@@ -373,7 +373,7 @@ class TestTags(object):
 
 class TestExtendVG(object):
 
-    def setup(self):
+    def setup_method(self):
         self.foo_volume = api.VolumeGroup(vg_name='foo', lv_tags='')
 
     def test_uses_single_device_in_list(self, monkeypatch, fake_run):
@@ -397,7 +397,7 @@ class TestExtendVG(object):
 
 class TestReduceVG(object):
 
-    def setup(self):
+    def setup_method(self):
         self.foo_volume = api.VolumeGroup(vg_name='foo', lv_tags='')
 
     def test_uses_single_device_in_list(self, monkeypatch, fake_run):
@@ -421,7 +421,7 @@ class TestReduceVG(object):
 
 class TestCreateVG(object):
 
-    def setup(self):
+    def setup_method(self):
         self.foo_volume = api.VolumeGroup(vg_name='foo', lv_tags='')
 
     def test_no_name(self, monkeypatch, fake_run):
@@ -782,7 +782,7 @@ class TestGetLVs(object):
 
 class TestGetSinglePV(object):
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_pvs')
+    @patch('ceph_volume.api.lvm.get_pvs')
     def test_get_single_pv_multiple_matches_raises_runtimeerror(self, m_get_pvs):
         fake_pvs = []
         fake_pvs.append(api.PVolume(pv_name='/dev/sda', pv_tags={}))
@@ -794,14 +794,14 @@ class TestGetSinglePV(object):
             api.get_single_pv()
         assert "matched more than 1 PV present on this host." in str(e.value)
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_pvs')
+    @patch('ceph_volume.api.lvm.get_pvs')
     def test_get_single_pv_no_match_returns_none(self, m_get_pvs):
         m_get_pvs.return_value = []
 
         pv = api.get_single_pv()
         assert pv == None
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_pvs')
+    @patch('ceph_volume.api.lvm.get_pvs')
     def test_get_single_pv_one_match(self, m_get_pvs):
         fake_pvs = []
         fake_pvs.append(api.PVolume(pv_name='/dev/sda', pv_tags={}))
@@ -815,7 +815,7 @@ class TestGetSinglePV(object):
 
 class TestGetSingleVG(object):
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_vgs')
+    @patch('ceph_volume.api.lvm.get_vgs')
     def test_get_single_vg_multiple_matches_raises_runtimeerror(self, m_get_vgs):
         fake_vgs = []
         fake_vgs.append(api.VolumeGroup(vg_name='vg1'))
@@ -827,14 +827,14 @@ class TestGetSingleVG(object):
             api.get_single_vg()
         assert "matched more than 1 VG present on this host." in str(e.value)
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_vgs')
+    @patch('ceph_volume.api.lvm.get_vgs')
     def test_get_single_vg_no_match_returns_none(self, m_get_vgs):
         m_get_vgs.return_value = []
 
         vg = api.get_single_vg()
         assert vg == None
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_vgs')
+    @patch('ceph_volume.api.lvm.get_vgs')
     def test_get_single_vg_one_match(self, m_get_vgs):
         fake_vgs = []
         fake_vgs.append(api.VolumeGroup(vg_name='vg1'))
@@ -847,7 +847,7 @@ class TestGetSingleVG(object):
 
 class TestGetSingleLV(object):
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_lvs')
+    @patch('ceph_volume.api.lvm.get_lvs')
     def test_get_single_lv_multiple_matches_raises_runtimeerror(self, m_get_lvs):
         fake_lvs = []
         fake_lvs.append(api.Volume(lv_name='lv1',
@@ -866,14 +866,14 @@ class TestGetSingleLV(object):
             api.get_single_lv()
         assert "matched more than 1 LV present on this host" in str(e.value)
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_lvs')
+    @patch('ceph_volume.api.lvm.get_lvs')
     def test_get_single_lv_no_match_returns_none(self, m_get_lvs):
         m_get_lvs.return_value = []
 
         lv = api.get_single_lv()
         assert lv == None
 
-    @patch('ceph_volume.devices.lvm.prepare.api.get_lvs')
+    @patch('ceph_volume.api.lvm.get_lvs')
     def test_get_single_lv_one_match(self, m_get_lvs):
         fake_lvs = []
         fake_lvs.append(api.Volume(lv_name='lv1', lv_path='/dev/vg1/lv1', vg_name='vg1', lv_tags='', lv_uuid='fake-uuid'))

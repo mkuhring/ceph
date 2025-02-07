@@ -1,3 +1,5 @@
+.. _dev-testing-unit-tests:
+
 Testing - unit tests
 ====================
 
@@ -165,6 +167,13 @@ Unit test caveats
    linked against the default memory allocator (glibc) unless they are
    explicitly linked against something else. This enables tools such as
    **valgrind** to be used in the tests.
+
+#. Google Test unit testing library hides the client output from the shell.
+   In order to debug the client after setting the desired debug level
+   (e.g ``ceph config set client debug_rbd 20``), the debug log file can
+   be found at ``build/out/client.admin.<pid>.log``.
+   This can also be handy when examining teuthology failed unit test
+   jobs, the job's debug level can be set at the relevant yaml file.
 
 .. _make check:
 .. _teuthology framework: https://github.com/ceph/teuthology

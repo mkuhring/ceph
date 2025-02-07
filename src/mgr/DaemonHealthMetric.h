@@ -5,7 +5,9 @@
 
 #include <cstdint>
 #include <ostream>
+#include "common/Formatter.h"
 #include "include/denc.h"
+#include "common/Formatter.h"
 
 enum class daemon_metric : uint8_t {
   SLOW_OPS,
@@ -44,8 +46,9 @@ public:
     : type(type_), value(n)
   {}
   DaemonHealthMetric(daemon_metric type_, uint32_t n1, uint32_t n2)
-    : type(type_), value(n1, n2)
+    : type(type_), value(n1, n2) 
   {}
+
   daemon_metric get_type() const {
     return type;
   }
@@ -58,11 +61,25 @@ public:
   uint32_t get_n2() const {
     return value.n2;
   }
+
   DENC(DaemonHealthMetric, v, p) {
     DENC_START(1, 1, p);
     denc(v.type, p);
     denc(v.value.n, p);
     DENC_FINISH(p);
+  }
+  void dump(Formatter *f) const {
+    f->dump_string("type", get_type_name());
+    f->dump_int("n", get_n());
+    f->dump_int("n1", get_n1());
+    f->dump_int("n2", get_n2());
+  }
+  static void generate_test_instances(std::list<DaemonHealthMetric*>& o) {
+    o.push_back(new DaemonHealthMetric(daemon_metric::SLOW_OPS, 1));
+    o.push_back(new DaemonHealthMetric(daemon_metric::PENDING_CREATING_PGS, 1, 2));
+  }
+  std::string get_type_name() const {
+    return daemon_metric_name(get_type());
   }
 
   friend std::ostream& operator<<(std::ostream& out, const DaemonHealthMetric& m) {

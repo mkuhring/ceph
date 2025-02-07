@@ -52,9 +52,8 @@ struct ImageDispatcher<I>::SendVisitor : public boost::static_visitor<bool> {
     return image_dispatch->discard(
       image_dispatch_spec->aio_comp,
       std::move(image_dispatch_spec->image_extents),
-      discard.discard_granularity_bytes, image_dispatch_spec->io_context,
-      image_dispatch_spec->parent_trace, image_dispatch_spec->tid,
-      &image_dispatch_spec->image_dispatch_flags,
+      discard.discard_granularity_bytes, image_dispatch_spec->parent_trace,
+      image_dispatch_spec->tid, &image_dispatch_spec->image_dispatch_flags,
       &image_dispatch_spec->dispatch_result,
       &image_dispatch_spec->aio_comp->image_dispatcher_ctx,
       &image_dispatch_spec->dispatcher_ctx);
@@ -64,33 +63,31 @@ struct ImageDispatcher<I>::SendVisitor : public boost::static_visitor<bool> {
     return image_dispatch->write(
       image_dispatch_spec->aio_comp,
       std::move(image_dispatch_spec->image_extents), std::move(write.bl),
-      image_dispatch_spec->io_context, image_dispatch_spec->op_flags,
-      image_dispatch_spec->parent_trace, image_dispatch_spec->tid,
-      &image_dispatch_spec->image_dispatch_flags,
+      image_dispatch_spec->op_flags, image_dispatch_spec->parent_trace,
+      image_dispatch_spec->tid, &image_dispatch_spec->image_dispatch_flags,
       &image_dispatch_spec->dispatch_result,
       &image_dispatch_spec->aio_comp->image_dispatcher_ctx,
       &image_dispatch_spec->dispatcher_ctx);
   }
 
-  bool  operator()(ImageDispatchSpec::WriteSame& write_same) const {
+  bool operator()(ImageDispatchSpec::WriteSame& write_same) const {
     return image_dispatch->write_same(
       image_dispatch_spec->aio_comp,
       std::move(image_dispatch_spec->image_extents), std::move(write_same.bl),
-      image_dispatch_spec->io_context, image_dispatch_spec->op_flags,
-      image_dispatch_spec->parent_trace, image_dispatch_spec->tid,
-      &image_dispatch_spec->image_dispatch_flags,
+      image_dispatch_spec->op_flags, image_dispatch_spec->parent_trace,
+      image_dispatch_spec->tid, &image_dispatch_spec->image_dispatch_flags,
       &image_dispatch_spec->dispatch_result,
       &image_dispatch_spec->aio_comp->image_dispatcher_ctx,
       &image_dispatch_spec->dispatcher_ctx);
   }
 
-  bool  operator()(
+  bool operator()(
       ImageDispatchSpec::CompareAndWrite& compare_and_write) const {
     return image_dispatch->compare_and_write(
       image_dispatch_spec->aio_comp,
       std::move(image_dispatch_spec->image_extents),
       std::move(compare_and_write.cmp_bl), std::move(compare_and_write.bl),
-      compare_and_write.mismatch_offset, image_dispatch_spec->io_context,
+      compare_and_write.mismatch_offset,
       image_dispatch_spec->op_flags, image_dispatch_spec->parent_trace,
       image_dispatch_spec->tid, &image_dispatch_spec->image_dispatch_flags,
       &image_dispatch_spec->dispatch_result,
@@ -134,8 +131,11 @@ struct ImageDispatcher<I>::PreprocessVisitor
   }
 
   bool clip_request() const {
+    auto area = (image_dispatch_spec->image_dispatch_flags &
+        IMAGE_DISPATCH_FLAG_CRYPTO_HEADER ? ImageArea::CRYPTO_HEADER :
+                                            ImageArea::DATA);
     int r = util::clip_request(image_dispatcher->m_image_ctx,
-                               &image_dispatch_spec->image_extents);
+                               &image_dispatch_spec->image_extents, area);
     if (r < 0) {
       image_dispatch_spec->fail(r);
       return true;
@@ -263,25 +263,6 @@ void ImageDispatcher<I>::unblock_writes() {
 template <typename I>
 void ImageDispatcher<I>::wait_on_writes_unblocked(Context *on_unblocked) {
   m_write_block_dispatch->wait_on_writes_unblocked(on_unblocked);
-}
-
-template <typename I>
-void ImageDispatcher<I>::remap_extents(Extents& image_extents,
-                                       ImageExtentsMapType type) {
-  auto loop = [&image_extents, type](auto begin, auto end) {
-      for (auto it = begin; it != end; ++it) {
-        auto& image_dispatch_meta = it->second;
-        auto image_dispatch = image_dispatch_meta.dispatch;
-        image_dispatch->remap_extents(image_extents, type);
-      }
-  };
-
-  std::shared_lock locker{this->m_lock};
-  if (type == IMAGE_EXTENTS_MAP_TYPE_LOGICAL_TO_PHYSICAL) {
-    loop(this->m_dispatches.cbegin(), this->m_dispatches.cend());
-  } else if (type == IMAGE_EXTENTS_MAP_TYPE_PHYSICAL_TO_LOGICAL) {
-    loop(this->m_dispatches.crbegin(), this->m_dispatches.crend());
-  }
 }
 
 template <typename I>

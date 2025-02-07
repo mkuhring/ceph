@@ -1,15 +1,14 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#ifndef CEPH_RGW_COROUTINE_H
-#define CEPH_RGW_COROUTINE_H
+#pragma once
 
 #ifdef _ASSERT_H
 #define NEED_ASSERT_H
 #pragma push_macro("_ASSERT_H")
 #endif
 
-#include <boost/asio.hpp>
+#include <boost/asio/coroutine.hpp>
 #include <boost/intrusive_ptr.hpp>
 
 #ifdef NEED_ASSERT_H
@@ -606,6 +605,7 @@ public:
 
   int hook_to_admin_command(const std::string& command);
   int call(std::string_view command, const cmdmap_t& cmdmap,
+	   const bufferlist&,
 	   Formatter *f,
 	   std::ostream& ss,
 	   bufferlist& out) override;
@@ -629,7 +629,7 @@ class RGWCoroutinesManager {
   RGWIOIDProvider io_id_provider;
 
   void handle_unblocked_stack(std::set<RGWCoroutinesStack *>& context_stacks, std::list<RGWCoroutinesStack *>& scheduled_stacks,
-                              RGWCompletionManager::io_completion& io, int *waiting_count);
+                              RGWCompletionManager::io_completion& io, int *waiting_count, int *interval_wait_count);
 protected:
   RGWCompletionManager *completion_mgr;
   RGWCoroutinesManagerRegistry *cr_registry;
@@ -700,6 +700,10 @@ RGWAioCompletionNotifier *RGWCoroutinesStack::create_completion_notifier(T value
 
 class RGWSimpleCoroutine : public RGWCoroutine {
   bool called_cleanup;
+  const int max_eio_retries;
+
+  int tries{0};
+  int op_ret{0};
 
   int operate(const DoutPrefixProvider *dpp) override;
 
@@ -711,7 +715,8 @@ class RGWSimpleCoroutine : public RGWCoroutine {
   void call_cleanup();
 
 public:
-  RGWSimpleCoroutine(CephContext *_cct) : RGWCoroutine(_cct), called_cleanup(false) {}
+  RGWSimpleCoroutine(CephContext *_cct) : RGWCoroutine(_cct), called_cleanup(false), max_eio_retries(1) {}
+  RGWSimpleCoroutine(CephContext *_cct, const int _max_eio_retries) : RGWCoroutine(_cct), called_cleanup(false), max_eio_retries(_max_eio_retries) {}
   virtual ~RGWSimpleCoroutine() override;
 
   virtual int init() { return 0; }
@@ -720,5 +725,3 @@ public:
   virtual int finish() { return 0; }
   virtual void request_cleanup() {}
 };
-
-#endif

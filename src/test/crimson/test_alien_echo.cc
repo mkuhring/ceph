@@ -8,6 +8,7 @@
 #include "crimson/net/Connection.h"
 #include "crimson/net/Dispatcher.h"
 #include "crimson/net/Messenger.h"
+#include "test/crimson/ctest_utils.h"
 
 #include <seastar/core/alien.hh>
 #include <seastar/core/app-template.hh>
@@ -59,10 +60,7 @@ struct Server {
   Server(crimson::net::MessengerRef msgr)
     : byte_throttler(local_conf()->osd_client_message_size_cap),
       msgr{msgr}
-  {
-    msgr->set_crc_header();
-    msgr->set_crc_data();
-  }
+  { }
 };
 
 struct Client {
@@ -84,10 +82,7 @@ struct Client {
   Client(crimson::net::MessengerRef msgr)
     : byte_throttler(local_conf()->osd_client_message_size_cap),
       msgr{msgr}
-  {
-    msgr->set_crc_header();
-    msgr->set_crc_data();
-  }
+  { }
 };
 } // namespace seastar_pingpong
 
@@ -172,22 +167,20 @@ seastar_echo(const entity_addr_t addr, echo_role role, unsigned count)
   if (role == echo_role::as_server) {
     return seastar::do_with(
         seastar_pingpong::Server{crimson::net::Messenger::create(
-            entity_name_t::OSD(0), "server", addr.get_nonce())},
+            entity_name_t::OSD(0), "server", addr.get_nonce(), true)},
         [addr, count](auto& server) mutable {
       std::cout << "server listening at " << addr << std::endl;
       // bind the server
       server.msgr->set_default_policy(crimson::net::SocketPolicy::stateless_server(0));
       server.msgr->set_policy_throttler(entity_name_t::TYPE_OSD,
                                         &server.byte_throttler);
-      server.msgr->set_require_authorizer(false);
       server.msgr->set_auth_client(&server.dummy_auth);
       server.msgr->set_auth_server(&server.dummy_auth);
       return server.msgr->bind(entity_addrvec_t{addr}
       ).safe_then([&server] {
         return server.msgr->start({&server.dispatcher});
-      }, crimson::net::Messenger::bind_ertr::all_same_way([](auto& e) {
-        ceph_abort_msg("bind failed");
-      })).then([&dispatcher=server.dispatcher, count] {
+      }, crimson::net::Messenger::bind_ertr::assert_all{"bind failed"}
+      ).then([&dispatcher=server.dispatcher, count] {
         return dispatcher.on_reply.wait([&dispatcher, count] {
           return dispatcher.count >= count;
         });
@@ -200,13 +193,12 @@ seastar_echo(const entity_addr_t addr, echo_role role, unsigned count)
   } else {
     return seastar::do_with(
         seastar_pingpong::Client{crimson::net::Messenger::create(
-            entity_name_t::OSD(1), "client", addr.get_nonce())},
+            entity_name_t::OSD(1), "client", addr.get_nonce(), true)},
         [addr, count](auto& client) {
       std::cout << "client sending to " << addr << std::endl;
       client.msgr->set_default_policy(crimson::net::SocketPolicy::lossy_client(0));
       client.msgr->set_policy_throttler(entity_name_t::TYPE_OSD,
                                         &client.byte_throttler);
-      client.msgr->set_require_authorizer(false);
       client.msgr->set_auth_client(&client.dummy_auth);
       client.msgr->set_auth_server(&client.dummy_auth);
       return client.msgr->start({&client.dispatcher}).then(
@@ -274,7 +266,7 @@ int main(int argc, char** argv)
   }
 
   auto count = vm["count"].as<unsigned>();
-  seastar::app_template app;
+  seastar::app_template app{get_smp_opts_from_ctest()};
   SeastarContext sc;
   auto job = sc.with_seastar([&] {
     auto fut = seastar::alien::submit_to(app.alien(), 0, [addr, role, count] {

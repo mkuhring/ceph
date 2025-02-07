@@ -120,9 +120,8 @@ public:
     }
   }
 
-  const char** get_tracked_conf_keys() const override {
-    static const char *KEYS[] = {"lockdep", NULL};
-    return KEYS;
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    return {"lockdep"s};
   }
 
   void handle_conf_change(const ConfigProxy& conf,
@@ -164,12 +163,8 @@ public:
   }
 
   // md_config_obs_t
-  const char** get_tracked_conf_keys() const override {
-    static const char *KEYS[] = {
-      "mempool_debug",
-      NULL
-    };
-    return KEYS;
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    return {"mempool_debug"s};
   }
 
   void handle_conf_change(const ConfigProxy& conf,
@@ -182,6 +177,7 @@ public:
 
   // AdminSocketHook
   int call(std::string_view command, const cmdmap_t& cmdmap,
+	   const bufferlist& inbl,
 	   ceph::Formatter *f,
 	   std::ostream& errss,
 	   bufferlist& out) override {
@@ -277,29 +273,27 @@ public:
     : log(l), lock(ceph::make_mutex("log_obs")) {
   }
 
-  const char** get_tracked_conf_keys() const override {
-    static const char *KEYS[] = {
-      "log_file",
-      "log_max_new",
-      "log_max_recent",
-      "log_to_file",
-      "log_to_syslog",
-      "err_to_syslog",
-      "log_stderr_prefix",
-      "log_to_stderr",
-      "err_to_stderr",
-      "log_to_graylog",
-      "err_to_graylog",
-      "log_graylog_host",
-      "log_graylog_port",
-      "log_to_journald",
-      "err_to_journald",
-      "log_coarse_timestamps",
-      "fsid",
-      "host",
-      NULL
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    return std::vector<std::string>{
+      "log_file"s,
+      "log_max_new"s,
+      "log_max_recent"s,
+      "log_to_file"s,
+      "log_to_syslog"s,
+      "err_to_syslog"s,
+      "log_stderr_prefix"s,
+      "log_to_stderr"s,
+      "err_to_stderr"s,
+      "log_to_graylog"s,
+      "err_to_graylog"s,
+      "log_graylog_host"s,
+      "log_graylog_port"s,
+      "log_to_journald"s,
+      "err_to_journald"s,
+      "log_coarse_timestamps"s,
+      "fsid"s,
+      "host"s
     };
-    return KEYS;
   }
 
   void handle_conf_change(const ConfigProxy& conf,
@@ -393,14 +387,12 @@ class CephContextObs : public md_config_obs_t {
 public:
   explicit CephContextObs(CephContext *cct) : cct(cct) {}
 
-  const char** get_tracked_conf_keys() const override {
-    static const char *KEYS[] = {
-      "enable_experimental_unrecoverable_data_corrupting_features",
-      "crush_location",
-      "container_image",  // just so we don't hear complaints about it!
-      NULL
+  std::vector<std::string> get_tracked_keys() const noexcept override {
+    return {
+      "enable_experimental_unrecoverable_data_corrupting_features"s,
+      "crush_location"s,
+      "container_image"s  // just so we don't hear complaints about it!
     };
-    return KEYS;
   }
 
   void handle_conf_change(const ConfigProxy& conf,
@@ -442,6 +434,7 @@ public:
   explicit CephContextHook(CephContext *cct) : m_cct(cct) {}
 
   int call(std::string_view command, const cmdmap_t& cmdmap,
+	   const bufferlist& inbl,
 	   Formatter *f,
 	   std::ostream& errss,
 	   bufferlist& out) override {
@@ -502,6 +495,14 @@ int CephContext::do_command(std::string_view command, const cmdmap_t& cmdmap,
   }
 }
 
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+static void leak_some_memory() {
+  volatile char *foo = new char[1234];
+  (void)foo;
+}
+#pragma GCC pop_options
+
 int CephContext::_do_command(
   std::string_view command, const cmdmap_t& cmdmap,
   Formatter *f,
@@ -520,8 +521,7 @@ int CephContext::_do_command(
     }
   }
   if (command == "leak_some_memory") {
-    char *foo = new char[1234];
-    (void)foo;
+    leak_some_memory();
   }
   else if (command == "perfcounters_dump" || command == "1" ||
       command == "perf dump") {
@@ -529,11 +529,18 @@ int CephContext::_do_command(
     std::string counter;
     cmd_getval(cmdmap, "logger", logger);
     cmd_getval(cmdmap, "counter", counter);
-    _perf_counters_collection->dump_formatted(f, false, logger, counter);
+    _perf_counters_collection->dump_formatted(f, false, select_labeled_t::unlabeled,
+                                              logger, counter);
   }
   else if (command == "perfcounters_schema" || command == "2" ||
     command == "perf schema") {
-    _perf_counters_collection->dump_formatted(f, true);
+    _perf_counters_collection->dump_formatted(f, true, select_labeled_t::unlabeled);
+  }
+  else if (command == "counter dump") {
+    _perf_counters_collection->dump_formatted(f, false, select_labeled_t::labeled);
+  }
+  else if (command == "counter schema") {
+    _perf_counters_collection->dump_formatted(f, true, select_labeled_t::labeled);
   }
   else if (command == "perf histogram dump") {
     std::string logger;
@@ -736,11 +743,13 @@ CephContext::CephContext(uint32_t module_type_,
   _admin_socket->register_command("leak_some_memory", _admin_hook, "");
   _admin_socket->register_command("perfcounters_dump", _admin_hook, "");
   _admin_socket->register_command("1", _admin_hook, "");
-  _admin_socket->register_command("perf dump name=logger,type=CephString,req=false name=counter,type=CephString,req=false", _admin_hook, "dump perfcounters value");
+  _admin_socket->register_command("perf dump name=logger,type=CephString,req=false name=counter,type=CephString,req=false", _admin_hook, "dump non-labeled counters and their values");
   _admin_socket->register_command("perfcounters_schema", _admin_hook, "");
   _admin_socket->register_command("perf histogram dump name=logger,type=CephString,req=false name=counter,type=CephString,req=false", _admin_hook, "dump perf histogram values");
   _admin_socket->register_command("2", _admin_hook, "");
-  _admin_socket->register_command("perf schema", _admin_hook, "dump perfcounters schema");
+  _admin_socket->register_command("perf schema", _admin_hook, "dump non-labeled counters schemas");
+  _admin_socket->register_command("counter dump", _admin_hook, "dump all labeled and non-labeled counters and their values");
+  _admin_socket->register_command("counter schema", _admin_hook, "dump all labeled and non-labeled counters schemas");
   _admin_socket->register_command("perf histogram schema", _admin_hook, "dump perf histogram schema");
   _admin_socket->register_command("perf reset name=var,type=CephString", _admin_hook, "perf reset <name>: perf reset all or one perfcounter name");
   _admin_socket->register_command("config show", _admin_hook, "dump current config settings");
@@ -1025,7 +1034,7 @@ void CephContext::notify_pre_fork()
 
 void CephContext::notify_post_fork()
 {
-  ceph::spin_unlock(&_fork_watchers_lock);
+  std::lock_guard lg(_fork_watchers_lock);
   for (auto &&t : _fork_watchers)
     t->handle_post_fork();
 }

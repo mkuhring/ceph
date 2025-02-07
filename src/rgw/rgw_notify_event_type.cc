@@ -31,7 +31,7 @@ namespace rgw::notify {
     case ObjectExpirationCurrent:
       return "s3:ObjectLifecycle:Expiration:Current";
     case ObjectExpirationNoncurrent:
-      return "s3:ObjectLifecycle:Expiration:Noncurrent";
+      return "s3:ObjectLifecycle:Expiration:NonCurrent";
     case ObjectExpirationDeleteMarker:
       return "s3:ObjectLifecycle:Expiration:DeleteMarker";
     case ObjectExpirationAbortMPU:
@@ -41,7 +41,7 @@ namespace rgw::notify {
     case ObjectTransitionCurrent:
       return "s3:ObjectLifecycle:Transition:Current";
     case ObjectTransitionNoncurrent:
-      return "s3:ObjectLifecycle:Transition:Noncurrent";
+      return "s3:ObjectLifecycle:Transition:NonCurrent";
     case ObjectSynced:
       return "s3:ObjectSynced:*";
     case ObjectSyncedCreate:
@@ -50,46 +50,26 @@ namespace rgw::notify {
       return "s3:ObjectSynced:Delete";
     case ObjectSyncedDeletionMarkerCreated:
       return "s3:ObjectSynced:DeletionMarkerCreated";
+    case LifecycleExpiration:
+      return "s3:LifecycleExpiration:*";
+    case LifecycleExpirationDelete:
+      return "s3:LifecycleExpiration:Delete";
+    case LifecycleExpirationDeleteMarkerCreated:
+      return "s3:LifecycleExpiration:DeleteMarkerCreated";
+    case LifecycleTransition:
+      return "s3:LifecycleTransition";
+    case Replication:
+      return "s3:Replication:*";
+    case ReplicationCreate:
+      return "s3:Replication:Create";
+    case ReplicationDelete:
+      return "s3:Replication:Delete";
+    case ReplicationDeletionMarkerCreated:
+      return "s3:Replication:DeletionMarkerCreated";
     case UnknownEvent:
         return "s3:UnknownEvent";
     }
     return "s3:UnknownEvent";
-  }
-
-  std::string to_ceph_string(EventType t) {
-    switch (t) {
-    case ObjectCreated:
-    case ObjectCreatedPut:
-    case ObjectCreatedPost:
-    case ObjectCreatedCopy:
-    case ObjectCreatedCompleteMultipartUpload:
-      return "OBJECT_CREATE";
-    case ObjectRemovedDelete:
-      return "OBJECT_DELETE";
-    case ObjectRemovedDeleteMarkerCreated:
-      return "DELETE_MARKER_CREATE";
-    case ObjectLifecycle:
-      return "OBJECT_LIFECYCLE";
-    case ObjectExpiration:
-    case ObjectExpirationCurrent:
-    case ObjectExpirationNoncurrent:
-    case ObjectExpirationDeleteMarker:
-    case ObjectExpirationAbortMPU:
-      return "OBJECT_EXPIRATION";
-    case ObjectTransition:
-    case ObjectTransitionCurrent:
-    case ObjectTransitionNoncurrent:
-      return "OBJECT_TRANSITION";
-    case ObjectSynced:
-    case ObjectSyncedCreate:
-    case ObjectSyncedDelete:
-    case ObjectSyncedDeletionMarkerCreated:
-      return "OBJECT_SYNCED";
-    case ObjectRemoved:
-    case UnknownEvent:
-      return "UNKNOWN_EVENT";
-    }
-    return "UNKNOWN_EVENT";
   }
 
   std::string to_event_string(EventType t) {
@@ -97,7 +77,7 @@ namespace rgw::notify {
   }
 
   EventType from_string(const std::string& s) {
-    if (s == "s3:ObjectCreated:*" || s == "OBJECT_CREATE")
+    if (s == "s3:ObjectCreated:*")
         return ObjectCreated;
     if (s == "s3:ObjectCreated:Put")
         return ObjectCreatedPut;
@@ -109,29 +89,33 @@ namespace rgw::notify {
         return ObjectCreatedCompleteMultipartUpload;
     if (s == "s3:ObjectRemoved:*")
         return ObjectRemoved;
-    if (s == "s3:ObjectRemoved:Delete" || s == "OBJECT_DELETE")
+    if (s == "s3:ObjectRemoved:Delete")
         return ObjectRemovedDelete;
-    if (s == "s3:ObjectRemoved:DeleteMarkerCreated" || s == "DELETE_MARKER_CREATE")
+    if (s == "s3:ObjectRemoved:DeleteMarkerCreated")
         return ObjectRemovedDeleteMarkerCreated;
     if (s == "s3:ObjectLifecycle:*")
         return ObjectLifecycle;
-    if (s == "s3:ObjectLifecycle:Expiration:*" || s == "OBJECT_EXPIRATION")
+    if (s == "s3:ObjectLifecycle:Expiration:*")
         return ObjectExpiration;
     if (s == "s3:ObjectLifecycle:Expiration:Current")
         return ObjectExpirationCurrent;
+    if (s == "s3:ObjectLifecycle:Expiration:NonCurrent")
+        return ObjectExpirationNonCurrent;
     if (s == "s3:ObjectLifecycle:Expiration:Noncurrent")
-        return ObjectExpirationNoncurrent;
+        return ObjectExpirationNonCurrent;
     if (s == "s3:ObjectLifecycle:Expiration:DeleteMarker")
         return ObjectExpirationDeleteMarker;
     if (s == "s3:ObjectLifecycle:Expiration:AbortMultipartUpload")
         return ObjectExpirationAbortMPU;
-    if (s == "s3:ObjectLifecycle:Transition:*" || s == "OBJECT_TRANSITION")
+    if (s == "s3:ObjectLifecycle:Transition:*")
         return ObjectTransition;
     if (s == "s3:ObjectLifecycle:Transition:Current")
         return ObjectTransitionCurrent;
+    if (s == "s3:ObjectLifecycle:Transition:NonCurrent")
+        return ObjectTransitionNonCurrent;
     if (s == "s3:ObjectLifecycle:Transition:Noncurrent")
-        return ObjectTransitionNoncurrent;
-    if (s == "s3:ObjectSynced:*" || s == "OBJECT_SYNCED")
+        return ObjectTransitionNonCurrent;
+    if (s == "s3:ObjectSynced:*")
         return ObjectSynced;
     if (s == "s3:ObjectSynced:Create")
         return ObjectSyncedCreate;
@@ -139,6 +123,22 @@ namespace rgw::notify {
         return ObjectSyncedDelete;
     if (s == "s3:ObjectSynced:DeletionMarkerCreated")
         return ObjectSyncedDeletionMarkerCreated;
+    if (s == "s3:LifecycleExpiration:*")
+      return LifecycleExpiration;
+    if (s == "s3:LifecycleExpiration:Delete")
+      return LifecycleExpirationDelete;
+    if (s == "s3:LifecycleExpiration:DeleteMarkerCreated")
+      return LifecycleExpirationDeleteMarkerCreated;
+    if (s == "s3:LifecycleTransition")
+      return LifecycleTransition;
+    if (s == "s3:Replication:*")
+      return Replication;
+    if (s == "s3:Replication:Create")
+      return ReplicationCreate;
+    if (s == "s3:Replication:Delete")
+      return ReplicationDelete;
+    if (s == "s3:Replication:DeletionMarkerCreated")
+      return ReplicationDeletionMarkerCreated;
     return UnknownEvent;
   }
 

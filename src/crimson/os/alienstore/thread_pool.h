@@ -11,17 +11,14 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/resource.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 
-#if __cplusplus > 201703L
-#include <semaphore>
-namespace crimson {
-  using std::counting_semaphore;
-}
-#else
+// std::counting_semaphore is buggy in libstdc++-11
+// (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=104928),
+// so we switch back to the homebrew version for now.
 #include "semaphore.h"
-#endif
 
 namespace crimson::os {
 
@@ -125,7 +122,7 @@ public:
    * @note each @c Task has its own crimson::thread::Condition, which possesses
    * an fd, so we should keep the size of queue under a reasonable limit.
    */
-  ThreadPool(size_t n_threads, size_t queue_sz, std::vector<uint64_t> cpus);
+  ThreadPool(size_t n_threads, size_t queue_sz, const std::optional<seastar::resource::cpuset>& cpus);
   ~ThreadPool();
   seastar::future<> start();
   seastar::future<> stop();
@@ -163,7 +160,7 @@ private:
   bool is_stopping() const {
     return stopping.load(std::memory_order_relaxed);
   }
-  static void pin(const std::vector<uint64_t>& cpus);
+  static void pin(const seastar::resource::cpuset& cpus);
   static void block_sighup();
   seastar::semaphore& local_free_slots() {
     return submit_queue.local().free_slots;

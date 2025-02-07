@@ -1,5 +1,6 @@
 <ng-container *ngIf="selection">
-  <table class="table table-striped table-bordered">
+  <table class="cds--data-table--sort cds--data-table--no-border cds--data-table cds--data-table--md"
+         data-testid="config-details-table">
     <tbody>
       <tr>
         <td i18n
@@ -56,7 +57,7 @@
         <td>
           <span *ngFor="let flag of selection.flags">
             <span title="{{ flags[flag] }}">
-              <span class="badge badge-dark mr-2">{{ flag | uppercase }}</span>
+              <span class="badge badge-dark me-2">{{ flag | uppercase }}</span>
             </span>
           </span>
         </td>
@@ -66,7 +67,7 @@
             class="bold">Services</td>
         <td>
           <span *ngFor="let service of selection.services">
-            <span class="badge badge-dark mr-2">{{ service }}</span>
+            <span class="badge badge-dark me-2">{{ service }}</span>
           </span>
         </td>
       </tr>

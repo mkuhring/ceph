@@ -6,12 +6,16 @@ import collections
 import errno
 import logging
 import os
+import socket
 import ssl
 import sys
 import tempfile
 import threading
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+from .controllers.multi_cluster import MultiCluster
 
 if TYPE_CHECKING:
     if sys.version_info >= (3, 8):
@@ -25,15 +29,17 @@ from mgr_util import ServerConfigException, build_url, \
     create_self_signed_cert, get_default_addr, verify_tls_files
 
 from . import mgr
+from .controllers import nvmeof  # noqa # pylint: disable=unused-import
 from .controllers import Router, json_error_page
 from .grafana import push_local_dashboards
+from .services import nvmeof_cli  # noqa # pylint: disable=unused-import
 from .services.auth import AuthManager, AuthManagerTool, JwtManager
 from .services.exception import dashboard_exception_handler
-from .services.rgw_client import configure_rgw_credentials
+from .services.service import RgwServiceManager
 from .services.sso import SSO_COMMANDS, handle_sso_command
 from .settings import handle_option_command, options_command_list, options_schema_list
 from .tools import NotificationQueue, RequestLoggingTool, TaskManager, \
-    prepare_url_prefix, str_to_bool
+    configure_cors, prepare_url_prefix, str_to_bool
 
 try:
     import cherrypy
@@ -43,10 +49,6 @@ except ImportError:
     cherrypy = None
 
 from .services.sso import load_sso_db
-
-if cherrypy is not None:
-    from .cherrypy_backports import patch_cherrypy
-    patch_cherrypy(cherrypy.__version__)
 
 # pylint: disable=wrong-import-position
 from .plugins import PLUGIN_MANAGER, debug, feature_toggles, motd  # isort:skip # noqa E501 # pylint: disable=unused-import
@@ -117,6 +119,7 @@ class CherryPyConfig(object):
 
         # Initialize custom handlers.
         cherrypy.tools.authenticate = AuthManagerTool()
+        configure_cors()
         cherrypy.tools.plugin_hooks_filter_request = cherrypy.Tool(
             'before_handler',
             lambda: PLUGIN_MANAGER.hook.filter_request_before_handler(request=cherrypy.request),
@@ -175,9 +178,9 @@ class CherryPyConfig(object):
             context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             context.load_cert_chain(cert_fname, pkey_fname)
             if sys.version_info >= (3, 7):
-                context.minimum_version = ssl.TLSVersion.TLSv1_2
+                context.minimum_version = ssl.TLSVersion.TLSv1_3
             else:
-                context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+                context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2
 
             config['server.ssl_module'] = 'builtin'
             config['server.ssl_certificate'] = cert_fname
@@ -268,7 +271,10 @@ class Module(MgrModule, CherryPyConfig):
         Option(name='standby_behaviour', type='str', default='redirect',
                enum_allowed=['redirect', 'error']),
         Option(name='standby_error_status_code', type='int', default=500,
-               min=400, max=599)
+               min=400, max=599),
+        Option(name='redirect_resolve_ip_addr', type='bool', default=False),
+        Option(name='cross_origin_url', type='str', default=''),
+        Option(name='sso_oauth2', type='bool', default=False),
     ]
     MODULE_OPTIONS.extend(options_schema_list())
     for options in PLUGIN_MANAGER.hook.get_options() or []:
@@ -388,6 +394,11 @@ class Module(MgrModule, CherryPyConfig):
             self.set_store(item_key, inbuf)
         return 0, f'SSL {item_label} updated', ''
 
+    def get_cluster_credentials_files(self, targets: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:  # noqa E501 #pylint: disable=line-too-long
+        multi_cluster_instance = MultiCluster()
+        cluster_credentials_files, clusters_credentials = multi_cluster_instance.get_cluster_credentials_files(targets)  # noqa E501 #pylint: disable=line-too-long
+        return cluster_credentials_files, clusters_credentials
+
     @CLIWriteCommand("dashboard set-ssl-certificate")
     def set_ssl_certificate(self, mgr_id: Optional[str] = None, inbuf: Optional[str] = None):
         return self._set_ssl_item('certificate', 'crt', mgr_id, inbuf)
@@ -411,7 +422,8 @@ class Module(MgrModule, CherryPyConfig):
     @CLIWriteCommand("dashboard set-rgw-credentials")
     def set_rgw_credentials(self):
         try:
-            configure_rgw_credentials()
+            rgw_service_manager = RgwServiceManager()
+            rgw_service_manager.configure_rgw_credentials()
         except Exception as error:
             return -errno.EINVAL, '', str(error)
 
@@ -449,6 +461,40 @@ class Module(MgrModule, CherryPyConfig):
         '''
         mgr.set_store('custom_login_banner', None)
         return HandleCommandResult(stdout='Login banner removed')
+
+    # allow cors by setting cross_origin_url
+    # the value is a comma separated list of URLs
+    @CLIWriteCommand("dashboard set-cross-origin-url")
+    def set_cross_origin_url(self, value: str):
+        cross_origin_urls = self.get_module_option('cross_origin_url', '')
+        cross_origin_urls_list = [url.strip()
+                                  for url in cross_origin_urls.split(',')]  # type: ignore
+        urls = [v.strip() for v in value.split(',')]
+        for url in urls:
+            if url in cross_origin_urls_list:
+                return -errno.EINVAL, '', 'Cross-origin URL already set'
+            cross_origin_urls_list.append(url)
+        self.set_module_option('cross_origin_url', ','.join(cross_origin_urls_list))
+        configure_cors()
+        return 0, 'Cross-origin URL set', ''
+
+    @CLIReadCommand("dashboard get-cross-origin-url")
+    def get_cross_origin_url(self):
+        urls = self.get_module_option('cross_origin_url', '')
+        if urls:
+            return HandleCommandResult(stdout=urls)  # type: ignore
+        return HandleCommandResult(stdout='No cross-origin URL set')
+
+    @CLIReadCommand("dashboard rm-cross-origin-url")
+    def rm_cross_origin_url(self, value: str):
+        urls = self.get_module_option('cross_origin_url', '')
+        urls_list = [url.strip() for url in urls.split(',')]  # type: ignore
+        if value not in urls_list:
+            return -errno.EINVAL, '', 'Cross-origin URL not set'
+        urls_list.remove(value)
+        self.set_module_option('cross_origin_url', ','.join(urls_list))
+        configure_cors()
+        return 0, 'Cross-origin URL removed', ''
 
     def handle_command(self, inbuf, cmd):
         # pylint: disable=too-many-return-statements
@@ -525,6 +571,13 @@ class StandbyModule(MgrStandbyModule, CherryPyConfig):
                         return None
 
                     if active_uri:
+                        if module.get_module_option('redirect_resolve_ip_addr'):
+                            p_result = urlparse(active_uri)
+                            hostname = str(p_result.hostname)
+                            fqdn_netloc = p_result.netloc.replace(
+                                hostname, socket.getfqdn(hostname))
+                            active_uri = p_result._replace(netloc=fqdn_netloc).geturl()
+
                         module.log.info("Redirecting to active '%s'", active_uri)
                         raise cherrypy.HTTPRedirect(active_uri)
                     else:

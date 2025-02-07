@@ -26,7 +26,7 @@ export class ErasureCodeProfileFormModalComponent
   @Output()
   submitAction = new EventEmitter();
 
-  tooltips = this.ecpService.formTooltips;
+  tooltips!: Record<string, any>;
   PLUGIN = {
     LRC: 'lrc', // Locally Repairable Erasure Code
     SHEC: 'shec', // Shingled Erasure Code
@@ -89,6 +89,14 @@ export class ErasureCodeProfileFormModalComponent
         [Validators.required, CdValidators.custom('max', () => this.baseValueValidation())]
       ],
       crushFailureDomain: '', // Will be preselected
+      crushNumFailureDomains: [
+        0,
+        CdValidators.requiredIf({ crushOsdsPerFailureDomain: { op: 'minValue', arg1: 1 } })
+      ],
+      crushOsdsPerFailureDomain: [
+        0,
+        CdValidators.requiredIf({ crushNumFailureDomains: { op: 'minValue', arg1: 1 } })
+      ],
       crushRoot: null, // Will be preselected
       crushDeviceClass: '', // Will be preselected
       directory: '',
@@ -357,6 +365,8 @@ export class ErasureCodeProfileFormModalComponent
   }
 
   ngOnInit() {
+    this.tooltips = this.ecpService.formTooltips;
+
     this.ecpService
       .getInfo()
       .subscribe(
@@ -375,7 +385,8 @@ export class ErasureCodeProfileFormModalComponent
             nodes,
             this.form.get('crushRoot'),
             this.form.get('crushFailureDomain'),
-            this.form.get('crushDeviceClass')
+            this.form.get('crushDeviceClass'),
+            false
           );
           this.plugins = plugins;
           this.names = names;
@@ -448,6 +459,8 @@ export class ErasureCodeProfileFormModalComponent
   private extendJson(name: string, ecp: ErasureCodeProfile) {
     const differentApiAttributes = {
       crushFailureDomain: 'crush-failure-domain',
+      crushNumFailureDomains: 'crush-num-failure-domains',
+      crushOsdsPerFailureDomain: 'crush-osds-per-failure-domain',
       crushRoot: 'crush-root',
       crushDeviceClass: 'crush-device-class',
       packetSize: 'packetsize',

@@ -25,15 +25,17 @@ public:
 // AWS compliant topics handler factory
 class RGWHandler_REST_PSTopic_AWS : public RGWHandler_REST {
   const rgw::auth::StrategyRegistry& auth_registry;
-  const std::string& post_body;
-  void rgw_topic_parse_input();
+  bufferlist bl_post_body;
 protected:
   RGWOp* op_post() override;
 public:
-  RGWHandler_REST_PSTopic_AWS(const rgw::auth::StrategyRegistry& _auth_registry, const std::string& _post_body) : 
-      auth_registry(_auth_registry),
-      post_body(_post_body) {}
+  RGWHandler_REST_PSTopic_AWS(const rgw::auth::StrategyRegistry& _auth_registry,
+                              bufferlist bl_post_body)
+    :  auth_registry(_auth_registry), bl_post_body(std::move(bl_post_body)) {}
   virtual ~RGWHandler_REST_PSTopic_AWS() = default;
   int postauth_init(optional_yield) override { return 0; }
   int authorize(const DoutPrefixProvider* dpp, optional_yield y) override;
+  static bool action_exists(const req_state* s);
+  static bool action_exists(const req_info& info);
 };
+

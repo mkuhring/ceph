@@ -14,9 +14,9 @@
 #include <iostream>
 #include "common/ceph_json.h"
 #include "common/Formatter.h"
-#include "rgw/rgw_common.h"
-#include "rgw/rgw_rados.h"
-#include "rgw/rgw_zone.h"
+#include "rgw_common.h"
+#include "rgw_rados.h"
+#include "rgw_zone.h"
 
 #ifndef CEPH_TEST_RGW_COMMON_H
 #define CEPH_TEST_RGW_COMMON_H
@@ -501,6 +501,8 @@ void test_rgw_init_old_bucket(old_rgw_bucket *bucket, const char *name);
 void test_rgw_populate_bucket(rgw_bucket *b, const char *t, const char *n, const char *m, const char *id);
 void test_rgw_init_bucket(rgw_bucket *bucket, const char *name);
 rgw_obj test_rgw_create_obj(const rgw_bucket& bucket, const std::string& name, const std::string& instance, const std::string& ns);
+
+
 
 #endif
 

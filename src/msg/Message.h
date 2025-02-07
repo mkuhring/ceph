@@ -15,11 +15,15 @@
 #ifndef CEPH_MESSAGE_H
 #define CEPH_MESSAGE_H
 
+#include <concepts>
 #include <cstdlib>
 #include <ostream>
 #include <string_view>
 
 #include <boost/intrusive/list.hpp>
+#if FMT_VERSION >= 90000
+#include <fmt/ostream.h>
+#endif
 
 #include "include/Context.h"
 #include "common/RefCountedObj.h"
@@ -28,16 +32,13 @@
 #include "common/ref.h"
 #include "common/debug.h"
 #include "common/zipkin_trace.h"
+#include "common/tracer.h"
 #include "include/ceph_assert.h" // Because intrusive_ptr clobbers our assert...
 #include "include/buffer.h"
 #include "include/types.h"
 #include "msg/Connection.h"
 #include "msg/MessageRef.h"
 #include "msg_types.h"
-
-#ifdef WITH_SEASTAR
-#  include "crimson/net/SocketConnection.h"
-#endif // WITH_SEASTAR
 
 // monitor internal
 #define MSG_MON_SCRUB              64
@@ -58,6 +59,7 @@
 #define MSG_GETPOOLSTATSREPLY      59
 
 #define MSG_MON_GLOBAL_ID          60
+#define MSG_MON_USED_PENDING_KEYS  141
 
 #define MSG_ROUTE                  47
 #define MSG_FORWARD                46
@@ -134,6 +136,8 @@
 #define MSG_OSD_PG_UPDATE_LOG_MISSING  114
 #define MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY  115
 
+#define MSG_OSD_PG_PCT 136
+
 #define MSG_OSD_PG_CREATED      116
 #define MSG_OSD_REP_SCRUBMAP    117
 #define MSG_OSD_PG_RECOVERY_DELETE 118
@@ -197,6 +201,8 @@
 #define MSG_MDS_METRICS            0x501  // for mds metric aggregator
 #define MSG_MDS_PING               0x502  // for mds pinger
 #define MSG_MDS_SCRUB_STATS        0x503  // for mds scrub stack
+#define MSG_MDS_QUIESCE_DB_LISTING 0x505  // quiesce db replication
+#define MSG_MDS_QUIESCE_DB_ACK     0x506  // quiesce agent ack back to the db
 
 // *** generic ***
 #define MSG_TIMECHECK             0x600
@@ -238,6 +244,12 @@
 // *** ceph-mgr <-> MON daemons ***
 #define MSG_MGR_UPDATE     0x70b
 
+// *** nvmeof mon -> gw daemons ***
+#define MSG_MNVMEOF_GW_MAP        0x800
+
+// *** gw daemons -> nvmeof mon  ***
+#define MSG_MNVMEOF_GW_BEACON     0x801
+
 // ======================================================
 
 // abstract Message class
@@ -245,14 +257,15 @@
 class Message : public RefCountedObject {
 public:
 #ifdef WITH_SEASTAR
-  using ConnectionRef = crimson::net::ConnectionRef;
+  // In crimson, conn is independently maintained outside Message.
+  using ConnectionRef = void*;
 #else
   using ConnectionRef = ::ConnectionRef;
-#endif // WITH_SEASTAR
+#endif
 
 protected:
-  ceph_msg_header  header;      // headerelope
-  ceph_msg_footer  footer;
+  ceph_msg_header  header{};      // headerelope
+  ceph_msg_footer  footer{};
   ceph::buffer::list       payload;  // "front" unaligned blob
   ceph::buffer::list       middle;   // "middle" unaligned blob
   ceph::buffer::list       data;     // data payload (page-alignment will be preserved where possible)
@@ -279,6 +292,11 @@ public:
   ZTracer::Trace trace;
   void encode_trace(ceph::buffer::list &bl, uint64_t features) const;
   void decode_trace(ceph::buffer::list::const_iterator &p, bool create = false);
+
+  // otel tracing
+  jspan_context otel_trace{false, false};
+  void encode_otel_trace(ceph::buffer::list &bl, uint64_t features) const;
+  void decode_otel_trace(ceph::buffer::list::const_iterator &p, bool create = false);
 
   class CompletionHook : public Context {
   protected:
@@ -316,16 +334,11 @@ protected:
   friend class Messenger;
 
 public:
-  Message() {
-    memset(&header, 0, sizeof(header));
-    memset(&footer, 0, sizeof(footer));
-  }
+  Message() = default;
   Message(int t, int version=1, int compat_version=0) {
-    memset(&header, 0, sizeof(header));
     header.type = t;
     header.version = version;
     header.compat_version = compat_version;
-    memset(&footer, 0, sizeof(footer));
   }
 
   Message *get() {
@@ -343,8 +356,17 @@ protected:
       completion_hook->complete(0);
   }
 public:
-  const ConnectionRef& get_connection() const { return connection; }
+  const ConnectionRef& get_connection() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#endif
+    return connection;
+  }
   void set_connection(ConnectionRef c) {
+#ifdef WITH_SEASTAR
+    // In crimson, conn is independently maintained outside Message.
+    ceph_assert(c == nullptr);
+#endif
     connection = std::move(c);
   }
   CompletionHook* get_completion_hook() { return completion_hook; }
@@ -481,13 +503,21 @@ public:
     return entity_name_t(header.src);
   }
   entity_addr_t get_source_addr() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#else
     if (connection)
       return connection->get_peer_addr();
+#endif
     return entity_addr_t();
   }
   entity_addrvec_t get_source_addrs() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#else
     if (connection)
       return connection->get_peer_addrs();
+#endif
     return entity_addrvec_t();
   }
 
@@ -544,6 +574,14 @@ extern Message *decode_message(CephContext *cct, int crcflags,
 class SafeMessage : public Message {
 public:
   using Message::Message;
+  bool is_a_client() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#else
+    return get_connection()->get_peer_type() == CEPH_ENTITY_TYPE_CLIENT;
+#endif
+  }
+
 private:
   using RefCountedObject::get;
   using RefCountedObject::put;
@@ -562,4 +600,26 @@ MURef<T> make_message(Args&&... args) {
   return {new T(std::forward<Args>(args)...), TOPNSPC::common::UniquePtrDeleter{}};
 }
 }
+
+namespace fmt {
+// placed in the fmt namespace due to an ADL bug in g++ < 12
+// (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92944).
+// Specifically - gcc pre-12 can't handle two templated specializations of
+// the formatter if in two different namespaces.
+template <std::derived_from<Message> M>
+struct formatter<M> {
+  constexpr auto parse(fmt::format_parse_context& ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const M& m, FormatContext& ctx) const {
+    std::ostringstream oss;
+    m.print(oss);
+    if (auto ver = m.get_header().version; ver) {
+      return fmt::format_to(ctx.out(), "{} v{}", oss.str(), (uint32_t)ver);
+    } else {
+      return fmt::format_to(ctx.out(), "{}", oss.str());
+    }
+  }
+};
+}  // namespace fmt
+
 #endif

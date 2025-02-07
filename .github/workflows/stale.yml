@@ -9,7 +9,7 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/stale@v5
+      - uses: actions/stale@v9
         with:
           # PAT for GitHub API authentication
           repo-token: "${{ secrets.GITHUB_TOKEN }}"
@@ -39,16 +39,13 @@ jobs:
           days-before-pr-stale: 60
           
           # Idle number of days before closing stale PRs (exempts Issues)
-          days-before-pr-close: 90
+          days-before-pr-close: 30
           
           # Label to apply on staled PRs
           stale-pr-label: 'stale'
           
           # Labels on PRs exempted from stale
           exempt-pr-labels: 'pinned,security'
-          
-          # Exempt all PRs with milestones from stale (also exempts Issues)
-          exempt-all-pr-milestones: true
           
           # Max number of operations per run
           operations-per-run: 100

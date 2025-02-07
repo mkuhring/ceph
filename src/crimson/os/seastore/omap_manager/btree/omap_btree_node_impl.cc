@@ -36,12 +36,12 @@ using dec_ref_iertr = OMapInnerNode::base_iertr;
 using dec_ref_ret = dec_ref_iertr::future<>;
 template <typename T>
 dec_ref_ret dec_ref(omap_context_t oc, T&& addr) {
-  return oc.tm.dec_ref(oc.t, std::forward<T>(addr)).handle_error_interruptible(
+  return oc.tm.remove(oc.t, std::forward<T>(addr)).handle_error_interruptible(
     dec_ref_iertr::pass_further{},
     crimson::ct_error::assert_all{
       "Invalid error in OMapInnerNode helper dec_ref"
     }
-  ).si_then([](auto &&e) {});
+  ).discard_result();
 }
 
 /**
@@ -87,7 +87,7 @@ OMapInnerNode::handle_split(
 {
   LOG_PREFIX(OMapInnerNode::handle_split);
   DEBUGT("this: {}",  oc.t, *this);
-  if (!is_pending()) {
+  if (!is_mutable()) {
     auto mut = oc.tm.get_mutable_extent(oc.t, this)->cast<OMapInnerNode>();
     auto mut_iter = mut->iter_idx(iter.get_index());
     return mut->handle_split(oc, mut_iter, mresult);
@@ -195,72 +195,103 @@ OMapInnerNode::rm_key(omap_context_t oc, const std::string &key)
 OMapInnerNode::list_ret
 OMapInnerNode::list(
   omap_context_t oc,
-  const std::optional<std::string> &start,
+  const std::optional<std::string> &first,
+  const std::optional<std::string> &last,
   omap_list_config_t config)
 {
   LOG_PREFIX(OMapInnerNode::list);
-  if (start) {
-    DEBUGT("start={}, this: {}", oc.t, start, *this);
+  if (first && last) {
+    DEBUGT("first: {}, last: {}, this: {}", oc.t, *first, *last, *this);
+    assert(*first <= *last);
+  } else if (first) {
+    DEBUGT("first: {}, this: {}", oc.t, *first, *this);
+  } else if (last) {
+    DEBUGT("last: {}, this: {}", oc.t, *last, *this);
   } else {
     DEBUGT("this: {}", oc.t, *this);
   }
 
-  auto child_iter = start ?
-    get_containing_child(*start) :
+  auto first_iter = first ?
+    get_containing_child(*first) :
     iter_cbegin();
-  assert(child_iter != iter_cend());
+  auto last_iter = last ?
+    get_containing_child(*last) + 1:
+    iter_cend();
+  assert(first_iter != iter_cend());
 
   return seastar::do_with(
-    child_iter,
-    iter_cend(),
+    first_iter,
+    last_iter,
+    iter_t(first_iter),
     list_bare_ret(false, {}),
-    true,
-    start,
-    [this, oc, config](
-      auto &biter,
-      auto &eiter,
-      auto &ret,
-      bool &first_entry,
-      auto &start)
+    [this, &first, &last, oc, config](
+      auto &fiter,
+      auto &liter,
+      auto &iter,
+      auto &ret)
     {
       auto &complete = std::get<0>(ret);
       auto &result = std::get<1>(ret);
       return trans_intr::repeat(
-	[&, config, oc, this]() -> list_iertr::future<seastar::stop_iteration> {
-	  if (biter == eiter  || result.size() == config.max_result_size) {
-	    complete = biter == eiter;
-	    return list_iertr::make_ready_future<seastar::stop_iteration>(
-	      seastar::stop_iteration::yes);
-	  }
-	  auto laddr = biter->get_val();
-	  return omap_load_extent(
-	    oc, laddr,
-	    get_meta().depth - 1
-	  ).si_then([&, config, oc] (auto &&extent) {
+        [&, config, oc, this]() -> list_iertr::future<seastar::stop_iteration>
+      {
+        if (iter == liter) {
+          complete = true;
+          return list_iertr::make_ready_future<seastar::stop_iteration>(
+            seastar::stop_iteration::yes);
+        }
+	assert(result.size() < config.max_result_size);
+        auto laddr = iter->get_val();
+        return omap_load_extent(
+          oc, laddr,
+          get_meta().depth - 1
+        ).si_then([&, config, oc](auto &&extent) {
+	  return seastar::do_with(
+	    iter == fiter ? first : std::optional<std::string>(std::nullopt),
+	    iter == liter - 1 ? last : std::optional<std::string>(std::nullopt),
+	    [&result, extent = std::move(extent), config, oc](
+	      auto &nfirst,
+	      auto &nlast) {
 	    return extent->list(
 	      oc,
-	      first_entry ? start : std::nullopt,
-	      config.with_reduced_max(result.size())
-	    ).si_then([&, config](auto &&child_ret) mutable {
-	      boost::ignore_unused(config);   // avoid clang warning;
-	      auto &[child_complete, child_result] = child_ret;
-	      if (result.size() && child_result.size()) {
-		assert(child_result.begin()->first > result.rbegin()->first);
+	      nfirst,
+	      nlast,
+	      config.with_reduced_max(result.size()));
+	  }).si_then([&, config](auto &&child_ret) mutable {
+	    boost::ignore_unused(config);   // avoid clang warning;
+            auto &[child_complete, child_result] = child_ret;
+            if (result.size() && child_result.size()) {
+              assert(child_result.begin()->first > result.rbegin()->first);
+            }
+            if (child_result.size() && first && iter == fiter) {
+	      if (config.first_inclusive) {
+		assert(child_result.begin()->first >= *first);
+	      } else {
+		assert(child_result.begin()->first > *first);
 	      }
-	      if (child_result.size() && start && first_entry) {
-		assert(child_result.begin()->first > *start);
+            }
+            if (child_result.size() && last && iter == liter - 1) {
+	      auto biter = --(child_result.end());
+	      if (config.last_inclusive) {
+		assert(biter->first <= *last);
+	      } else {
+		assert(biter->first < *last);
 	      }
-	      result.merge(std::move(child_result));
-	      ++biter;
-	      assert(child_complete || result.size() == config.max_result_size);
-	      first_entry = false;
+            }
+            result.merge(std::move(child_result));
+	    if (result.size() == config.max_result_size) {
 	      return list_iertr::make_ready_future<seastar::stop_iteration>(
-		seastar::stop_iteration::no);
-	    });
-	  });
-	}).si_then([&ret, ref = OMapNodeRef(this)] {
-	  return list_iertr::make_ready_future<list_bare_ret>(std::move(ret));
-	});
+		seastar::stop_iteration::yes);
+	    }
+            ++iter;
+            assert(child_complete);
+            return list_iertr::make_ready_future<seastar::stop_iteration>(
+              seastar::stop_iteration::no);
+          });
+        });
+      }).si_then([&ret, ref = OMapNodeRef(this)] {
+        return list_iertr::make_ready_future<list_bare_ret>(std::move(ret));
+      });
     });
 }
 
@@ -307,7 +338,10 @@ OMapInnerNode:: make_split_children(omap_context_t oc)
       return split_children_ret(
              interruptible::ready_future_marker{},
              std::make_tuple(left, right, split_into(*left, *right)));
-  });
+  }).handle_error_interruptible(
+    crimson::ct_error::enospc::assert_failure{"unexpected enospc"},
+    split_children_iertr::pass_further{}
+  );
 }
 
 OMapInnerNode::full_merge_ret
@@ -315,14 +349,17 @@ OMapInnerNode::make_full_merge(omap_context_t oc, OMapNodeRef right)
 {
   LOG_PREFIX(OMapInnerNode::make_full_merge);
   DEBUGT("", oc.t);
-  return oc.tm.alloc_extent<OMapInnerNode>(oc.t, oc.hint,
+  return oc.tm.alloc_non_data_extent<OMapInnerNode>(oc.t, oc.hint,
     OMAP_INNER_BLOCK_SIZE)
     .si_then([this, right] (auto &&replacement) {
       replacement->merge_from(*this, *right->cast<OMapInnerNode>());
       return full_merge_ret(
         interruptible::ready_future_marker{},
         std::move(replacement));
-  });
+  }).handle_error_interruptible(
+    crimson::ct_error::enospc::assert_failure{"unexpected enospc"},
+    full_merge_iertr::pass_further{}
+  );
 }
 
 OMapInnerNode::make_balanced_ret
@@ -342,7 +379,10 @@ OMapInnerNode::make_balanced(omap_context_t oc, OMapNodeRef _right)
              std::make_tuple(replacement_left, replacement_right,
                              balance_into_new_nodes(*this, right,
                                *replacement_left, *replacement_right)));
-  });
+  }).handle_error_interruptible(
+    crimson::ct_error::enospc::assert_failure{"unexpected enospc"},
+    make_balanced_iertr::pass_further{}
+  );
 }
 
 OMapInnerNode::merge_entry_ret
@@ -353,7 +393,7 @@ OMapInnerNode::merge_entry(
 {
   LOG_PREFIX(OMapInnerNode::merge_entry);
   DEBUGT("{}, parent: {}", oc.t, *entry, *this);
-  if (!is_pending()) {
+  if (!is_mutable()) {
     auto mut = oc.tm.get_mutable_extent(oc.t, this)->cast<OMapInnerNode>();
     auto mut_iter = mut->iter_idx(iter->get_index());
     return mut->merge_entry(oc, mut_iter, entry);
@@ -494,7 +534,7 @@ OMapLeafNode::insert(
   DEBUGT("{} -> {}, this: {}", oc.t, key, value, *this);
   bool overflow = extent_will_overflow(key.size(), value.length());
   if (!overflow) {
-    if (!is_pending()) {
+    if (!is_mutable()) {
       auto mut = oc.tm.get_mutable_extent(oc.t, this)->cast<OMapLeafNode>();
       return mut->insert(oc, key, value);
     }
@@ -553,7 +593,7 @@ OMapLeafNode::rm_key(omap_context_t oc, const std::string &key)
   LOG_PREFIX(OMapLeafNode::rm_key);
   DEBUGT("{}, this: {}", oc.t, key, *this);
   auto rm_pt = find_string_key(key);
-  if (!is_pending() && rm_pt != iter_end()) {
+  if (!is_mutable() && rm_pt != iter_end()) {
     auto mut =  oc.tm.get_mutable_extent(oc.t, this)->cast<OMapLeafNode>();
     return mut->rm_key(oc, key);
   }
@@ -582,31 +622,41 @@ OMapLeafNode::rm_key(omap_context_t oc, const std::string &key)
 OMapLeafNode::list_ret
 OMapLeafNode::list(
   omap_context_t oc,
-  const std::optional<std::string> &start,
+  const std::optional<std::string> &first,
+  const std::optional<std::string> &last,
   omap_list_config_t config)
 {
   LOG_PREFIX(OMapLeafNode::list);
   DEBUGT(
-    "start {} max_result_size {} inclusive {}, this: {}",
+    "first {} last {}  max_result_size {} first_inclusive {} \
+    last_inclusive {}, this: {}",
     oc.t,
-    start ? start->c_str() : "",
+    first ? first->c_str() : "",
+    last ? last->c_str() : "",
     config.max_result_size,
-    config.inclusive,
+    config.first_inclusive,
+    config.last_inclusive,
     *this
   );
   auto ret = list_bare_ret(false, {});
   auto &[complete, result] = ret;
-  auto iter = start ?
-    (config.inclusive ?
-     string_lower_bound(*start) :
-     string_upper_bound(*start)) :
+  auto iter = first ?
+    (config.first_inclusive ?
+     string_lower_bound(*first) :
+     string_upper_bound(*first)) :
     iter_begin();
+  auto liter = last ?
+    (config.last_inclusive ?
+     string_upper_bound(*last) :
+     string_lower_bound(*last)) :
+    iter_end();
 
-  for (; iter != iter_end() && result.size() < config.max_result_size; iter++) {
+  for (; iter != liter && result.size() < config.max_result_size; iter++) {
     result.emplace(std::make_pair(iter->get_key(), iter->get_val()));
+    DEBUGT("found key {}", oc.t, iter->get_key());
   }
 
-  complete = (iter == iter_end());
+  complete = (iter == liter);
 
   return list_iertr::make_ready_future<list_bare_ret>(
     std::move(ret));
@@ -630,7 +680,10 @@ OMapLeafNode::make_split_children(omap_context_t oc)
       return split_children_ret(
              interruptible::ready_future_marker{},
              std::make_tuple(left, right, split_into(*left, *right)));
-  });
+  }).handle_error_interruptible(
+    crimson::ct_error::enospc::assert_failure{"unexpected enospc"},
+    split_children_iertr::pass_further{}
+  );
 }
 
 OMapLeafNode::full_merge_ret
@@ -639,13 +692,16 @@ OMapLeafNode::make_full_merge(omap_context_t oc, OMapNodeRef right)
   ceph_assert(right->get_type() == TYPE);
   LOG_PREFIX(OMapLeafNode::make_full_merge);
   DEBUGT("this: {}", oc.t, *this);
-  return oc.tm.alloc_extent<OMapLeafNode>(oc.t, oc.hint, OMAP_LEAF_BLOCK_SIZE)
+  return oc.tm.alloc_non_data_extent<OMapLeafNode>(oc.t, oc.hint, OMAP_LEAF_BLOCK_SIZE)
     .si_then([this, right] (auto &&replacement) {
       replacement->merge_from(*this, *right->cast<OMapLeafNode>());
       return full_merge_ret(
         interruptible::ready_future_marker{},
         std::move(replacement));
-  });
+  }).handle_error_interruptible(
+    crimson::ct_error::enospc::assert_failure{"unexpected enospc"},
+    full_merge_iertr::pass_further{}
+  );
 }
 
 OMapLeafNode::make_balanced_ret
@@ -666,7 +722,10 @@ OMapLeafNode::make_balanced(omap_context_t oc, OMapNodeRef _right)
                balance_into_new_nodes(
                  *this, right,
                  *replacement_left, *replacement_right)));
-  });
+  }).handle_error_interruptible(
+    crimson::ct_error::enospc::assert_failure{"unexpected enospc"},
+    make_balanced_iertr::pass_further{}
+  );
 }
 
 
@@ -675,23 +734,28 @@ omap_load_extent(omap_context_t oc, laddr_t laddr, depth_t depth)
 {
   ceph_assert(depth > 0);
   if (depth > 1) {
-    return oc.tm.read_extent<OMapInnerNode>(oc.t, laddr,
-      OMAP_INNER_BLOCK_SIZE)
-      .handle_error_interruptible(
-      omap_load_extent_iertr::pass_further{},
-      crimson::ct_error::assert_all{ "Invalid error in omap_load_extent" }
-    ).si_then(
-      [](auto&& e) {
-      return seastar::make_ready_future<OMapNodeRef>(std::move(e));
-    });
-  } else {
-    return oc.tm.read_extent<OMapLeafNode>(oc.t, laddr, OMAP_LEAF_BLOCK_SIZE
+    return oc.tm.read_extent<OMapInnerNode>(
+        oc.t, laddr, OMAP_INNER_BLOCK_SIZE
     ).handle_error_interruptible(
       omap_load_extent_iertr::pass_further{},
       crimson::ct_error::assert_all{ "Invalid error in omap_load_extent" }
-    ).si_then(
-      [](auto&& e) {
-      return seastar::make_ready_future<OMapNodeRef>(std::move(e));
+    ).si_then([](auto maybe_indirect_extent) {
+      assert(!maybe_indirect_extent.is_indirect());
+      assert(!maybe_indirect_extent.is_clone);
+      return seastar::make_ready_future<OMapNodeRef>(
+          std::move(maybe_indirect_extent.extent));
+    });
+  } else {
+    return oc.tm.read_extent<OMapLeafNode>(
+        oc.t, laddr, OMAP_LEAF_BLOCK_SIZE
+    ).handle_error_interruptible(
+      omap_load_extent_iertr::pass_further{},
+      crimson::ct_error::assert_all{ "Invalid error in omap_load_extent" }
+    ).si_then([](auto maybe_indirect_extent) {
+      assert(!maybe_indirect_extent.is_indirect());
+      assert(!maybe_indirect_extent.is_clone);
+      return seastar::make_ready_future<OMapNodeRef>(
+          std::move(maybe_indirect_extent.extent));
     });
   }
 }

@@ -14,6 +14,7 @@
 #include <boost/statechart/transition.hpp>
 
 #include "osd/recovery_types.h"
+#include "osd/PGLog.h"
 
 namespace crimson::osd {
 
@@ -55,6 +56,14 @@ struct BackfillState {
   struct Triggered : sc::event<Triggered> {
   };
 
+  struct RequestDone : sc::event<RequestDone> {
+  };
+
+  struct SuspendBackfill : sc::event<SuspendBackfill> {
+  };
+
+  struct ThrottleAcquired : sc::event<ThrottleAcquired> {
+  };
 private:
   // internal events
   struct RequestPrimaryScanning : sc::event<RequestPrimaryScanning> {
@@ -64,9 +73,6 @@ private:
   };
 
   struct RequestWaiting : sc::event<RequestWaiting> {
-  };
-
-  struct RequestDone : sc::event<RequestDone> {
   };
 
   class ProgressTracker;
@@ -149,7 +155,6 @@ public:
       sc::transition<RequestPrimaryScanning, PrimaryScanning>,
       sc::transition<RequestReplicasScanning, ReplicasScanning>,
       sc::transition<RequestWaiting, Waiting>,
-      sc::transition<RequestDone, Done>,
       sc::transition<sc::event_base, Crashed>>;
     explicit Enqueuing(my_context);
 
@@ -206,11 +211,16 @@ public:
     using reactions = boost::mpl::list<
       sc::custom_reaction<ObjectPushed>,
       sc::custom_reaction<PrimaryScanned>,
+      sc::transition<RequestDone, Done>,
+      sc::custom_reaction<SuspendBackfill>,
+      sc::custom_reaction<Triggered>,
       sc::transition<sc::event_base, Crashed>>;
     explicit PrimaryScanning(my_context);
     sc::result react(ObjectPushed);
     // collect scanning result and transit to Enqueuing.
     sc::result react(PrimaryScanned);
+    sc::result react(SuspendBackfill);
+    sc::result react(Triggered);
   };
 
   struct ReplicasScanning : sc::state<ReplicasScanning, BackfillMachine>,
@@ -218,12 +228,17 @@ public:
     using reactions = boost::mpl::list<
       sc::custom_reaction<ObjectPushed>,
       sc::custom_reaction<ReplicaScanned>,
+      sc::custom_reaction<SuspendBackfill>,
+      sc::custom_reaction<Triggered>,
+      sc::transition<RequestDone, Done>,
       sc::transition<sc::event_base, Crashed>>;
     explicit ReplicasScanning(my_context);
     // collect scanning result; if all results are collected, transition
     // to Enqueuing will happen.
     sc::result react(ObjectPushed);
     sc::result react(ReplicaScanned);
+    sc::result react(SuspendBackfill);
+    sc::result react(Triggered);
 
     // indicate whether a particular peer should be scanned to retrieve
     // BackfillInterval for new range of hobject_t namespace.
@@ -241,16 +256,26 @@ public:
                    StateHelper<Waiting> {
     using reactions = boost::mpl::list<
       sc::custom_reaction<ObjectPushed>,
+      sc::transition<RequestDone, Done>,
+      sc::custom_reaction<SuspendBackfill>,
+      sc::custom_reaction<Triggered>,
+      sc::transition<ThrottleAcquired, Enqueuing>,
       sc::transition<sc::event_base, Crashed>>;
     explicit Waiting(my_context);
     sc::result react(ObjectPushed);
+    sc::result react(SuspendBackfill);
+    sc::result react(Triggered);
   };
 
   struct Done : sc::state<Done, BackfillMachine>,
                 StateHelper<Done> {
     using reactions = boost::mpl::list<
+      sc::custom_reaction<SuspendBackfill>,
       sc::transition<sc::event_base, Crashed>>;
     explicit Done(my_context);
+    sc::result react(SuspendBackfill) {
+      return discard_event();
+    }
   };
 
   BackfillState(BackfillListener& backfill_listener,
@@ -263,15 +288,58 @@ public:
     backfill_machine.process_event(*std::move(evt));
   }
 
+  void enqueue_standalone_push(
+    const hobject_t &obj,
+    const eversion_t &v,
+    const std::vector<pg_shard_t> &peers);
+  void enqueue_standalone_delete(
+    const hobject_t &obj,
+    const eversion_t &v,
+    const std::vector<pg_shard_t> &peers);
+
+
+  bool is_triggered() const {
+    return backfill_machine.triggering_event() != nullptr;
+  }
+
   hobject_t get_last_backfill_started() const {
     return last_backfill_started;
   }
+
+  void backfill_target_done() {
+    ceph_assert(replicas_in_backfill > 0);
+    replicas_in_backfill--;
+    if (!replicas_in_backfill) {
+      backfill_machine.process_event(RequestDone{});
+    }
+  }
 private:
+  struct backfill_suspend_state_t {
+    bool suspended = false;
+    bool should_go_enqueuing = false;
+  } backfill_suspend_state;
+  bool is_suspended() const {
+    return backfill_suspend_state.suspended;
+  }
+  void on_suspended() {
+    ceph_assert(!is_suspended());
+    backfill_suspend_state = {true, false};
+  }
+  bool on_resumed() {
+    auto go_enqueuing = backfill_suspend_state.should_go_enqueuing;
+    backfill_suspend_state = {false, false};
+    return go_enqueuing;
+  }
+  void go_enqueuing_on_resume() {
+    ceph_assert(is_suspended());
+    backfill_suspend_state.should_go_enqueuing = true;
+  }
   hobject_t last_backfill_started;
   BackfillInterval backfill_info;
   std::map<pg_shard_t, BackfillInterval> peer_backfill_info;
   BackfillMachine backfill_machine;
   std::unique_ptr<ProgressTracker> progress_tracker;
+  size_t replicas_in_backfill = 0;
 };
 
 // BackfillListener -- an interface used by the backfill FSM to request
@@ -291,7 +359,8 @@ struct BackfillState::BackfillListener {
 
   virtual void enqueue_push(
     const hobject_t& obj,
-    const eversion_t& v) = 0;
+    const eversion_t& v,
+    const std::vector<pg_shard_t> &peers) = 0;
 
   virtual void enqueue_drop(
     const pg_shard_t& target,
@@ -317,6 +386,7 @@ struct BackfillState::PeeringFacade {
   virtual hobject_t earliest_backfill() const = 0;
   virtual const std::set<pg_shard_t>& get_backfill_targets() const = 0;
   virtual const hobject_t& get_peer_last_backfill(pg_shard_t peer) const = 0;
+  virtual const PGLog& get_pg_log() const = 0;
   virtual const eversion_t& get_last_update() const = 0;
   virtual const eversion_t& get_log_tail() const = 0;
 
@@ -330,6 +400,10 @@ struct BackfillState::PeeringFacade {
   virtual void update_complete_backfill_object_stats(const hobject_t &hoid,
                                              const pg_stat_t &stats) = 0;
   virtual bool is_backfilling() const = 0;
+  virtual void prepare_backfill_for_missing(
+    const hobject_t &soid,
+    const eversion_t &v,
+    const std::vector<pg_shard_t> &peers) = 0;
   virtual ~PeeringFacade() {}
 };
 
@@ -338,8 +412,12 @@ struct BackfillState::PeeringFacade {
 // of behaviour that must be provided by a unit test's mock.
 struct BackfillState::PGFacade {
   virtual const eversion_t& get_projected_last_update() const = 0;
+  virtual const PGLog::IndexedLog& get_projected_log() const = 0;
+
+  virtual std::ostream &print(std::ostream &out) const = 0;
   virtual ~PGFacade() {}
 };
+std::ostream &operator<<(std::ostream &out, const BackfillState::PGFacade &pg);
 
 class BackfillState::ProgressTracker {
   // TODO: apply_stat,
@@ -366,6 +444,9 @@ class BackfillState::ProgressTracker {
   BackfillListener& backfill_listener() {
     return backfill_machine.backfill_listener;
   }
+  PGFacade& pg() {
+    return *backfill_machine.pg;
+  }
 
 public:
   ProgressTracker(BackfillMachine& backfill_machine)
@@ -376,7 +457,13 @@ public:
 
   bool enqueue_push(const hobject_t&);
   void enqueue_drop(const hobject_t&);
-  void complete_to(const hobject_t&, const pg_stat_t&);
+  void complete_to(const hobject_t&, const pg_stat_t&, bool may_push_to_max);
 };
 
 } // namespace crimson::osd
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::osd::BackfillState::PGFacade>
+  : fmt::ostream_formatter {};
+#endif
+

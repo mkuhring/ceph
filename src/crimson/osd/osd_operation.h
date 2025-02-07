@@ -27,16 +27,65 @@ struct ConnectionPipeline {
       "ConnectionPipeline::await_map";
   } await_map;
 
-  struct GetPG : OrderedExclusivePhaseT<GetPG> {
+  struct GetPGMapping : OrderedExclusivePhaseT<GetPGMapping> {
     static constexpr auto type_name =
-      "ConnectionPipeline::get_pg";
-  } get_pg;
+      "ConnectionPipeline::get_pg_mapping";
+  } get_pg_mapping;
 };
+
+struct PerShardPipeline {
+  struct CreateOrWaitPG : OrderedExclusivePhaseT<CreateOrWaitPG> {
+    static constexpr auto type_name =
+      "PerShardPipeline::create_or_wait_pg";
+  } create_or_wait_pg;
+};
+
+struct PGPeeringPipeline {
+  struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
+    static constexpr auto type_name = "PeeringEvent::PGPipeline::await_map";
+  } await_map;
+  struct Process : OrderedExclusivePhaseT<Process> {
+    static constexpr auto type_name = "PeeringEvent::PGPipeline::process";
+  } process;
+};
+
+struct CommonPGPipeline {
+  struct WaitPGReady : OrderedConcurrentPhaseT<WaitPGReady> {
+    static constexpr auto type_name = "CommonPGPipeline:::wait_pg_ready";
+  } wait_pg_ready;
+  struct GetOBC : OrderedExclusivePhaseT<GetOBC> {
+    static constexpr auto type_name = "CommonPGPipeline:::get_obc";
+  } get_obc;
+};
+
+struct PGRepopPipeline {
+  struct Process : OrderedExclusivePhaseT<Process> {
+    static constexpr auto type_name = "PGRepopPipeline::process";
+  } process;
+  struct WaitCommit : OrderedConcurrentPhaseT<WaitCommit> {
+    static constexpr auto type_name = "PGRepopPipeline::wait_repop";
+  } wait_commit;
+  struct SendReply : OrderedExclusivePhaseT<SendReply> {
+    static constexpr auto type_name = "PGRepopPipeline::send_reply";
+  } send_reply;
+};
+
+struct CommonOBCPipeline {
+  struct Process : OrderedExclusivePhaseT<Process> {
+    static constexpr auto type_name = "CommonOBCPipeline::process";
+  } process;
+  struct WaitRepop : OrderedConcurrentPhaseT<WaitRepop> {
+    static constexpr auto type_name = "CommonOBCPipeline::wait_repop";
+  } wait_repop;
+  struct SendReply : OrderedExclusivePhaseT<SendReply> {
+    static constexpr auto type_name = "CommonOBCPipeline::send_reply";
+  } send_reply;
+};
+
 
 enum class OperationTypeCode {
   client_request = 0,
   peering_event,
-  compound_peering_request,
   pg_advance_map,
   pg_creation,
   replicated_request,
@@ -44,15 +93,22 @@ enum class OperationTypeCode {
   background_recovery_sub,
   internal_client_request,
   historic_client_request,
+  historic_slow_client_request,
   logmissing_request,
   logmissing_request_reply,
+  snaptrim_event,
+  snaptrimobj_subevent,
+  scrub_requested,
+  scrub_message,
+  scrub_find_range,
+  scrub_reserve_range,
+  scrub_scan,
   last_op
 };
 
 static constexpr const char* const OP_NAMES[] = {
   "client_request",
   "peering_event",
-  "compound_peering_request",
   "pg_advance_map",
   "pg_creation",
   "replicated_request",
@@ -60,8 +116,16 @@ static constexpr const char* const OP_NAMES[] = {
   "background_recovery_sub",
   "internal_client_request",
   "historic_client_request",
+  "historic_slow_client_request",
   "logmissing_request",
   "logmissing_request_reply",
+  "snaptrim_event",
+  "snaptrimobj_subevent",
+  "scrub_requested",
+  "scrub_message",
+  "scrub_find_range",
+  "scrub_reserve_range",
+  "scrub_scan",
 };
 
 // prevent the addition of OperationTypeCode-s with no matching OP_NAMES entry:
@@ -134,17 +198,27 @@ protected:
     get_event<EventT>().trigger(*that(), std::forward<Args>(args)...);
   }
 
+  template <class BlockingEventT>
+  typename BlockingEventT::template Trigger<T>
+  get_trigger() {
+    return {get_event<BlockingEventT>(), *that()};
+  }
+
   template <class BlockingEventT, class InterruptorT=void, class F>
   auto with_blocking_event(F&& f) {
-    auto ret = std::forward<F>(f)(typename BlockingEventT::template Trigger<T>{
-      get_event<BlockingEventT>(), *that()
-    });
+    auto ret = std::forward<F>(f)(get_trigger<BlockingEventT>());
     if constexpr (std::is_same_v<InterruptorT, void>) {
       return ret;
     } else {
       using ret_t = decltype(ret);
       return typename InterruptorT::template futurize_t<ret_t>{std::move(ret)};
     }
+  }
+
+public:
+  static constexpr bool is_trackable = true;
+  virtual bool requires_pg() const {
+    return true;
   }
 };
 
@@ -174,6 +248,12 @@ protected:
     });
   }
 
+  template <class StageT>
+  void enter_stage_sync(StageT& stage) {
+    that()->get_handle().template enter_sync<T>(
+        stage, this->template get_trigger<typename StageT::BlockingEvent>());
+  }
+
   template <class OpT>
   friend class crimson::os::seastore::OperationProxyT;
 
@@ -193,13 +273,16 @@ struct OSDOperationRegistry : OperationRegistryT<
   void do_stop() override;
 
   void put_historic(const class ClientRequest& op);
+  void _put_historic(
+    op_list& list,
+    const class ClientRequest& op,
+    uint64_t max);
 
-  size_t dump_client_requests(ceph::Formatter* f) const;
   size_t dump_historic_client_requests(ceph::Formatter* f) const;
   size_t dump_slowest_historic_client_requests(ceph::Formatter* f) const;
+  void visit_ops_in_flight(std::function<void(const ClientRequest&)>&& visit);
 
 private:
-  op_list::const_iterator last_of_recents;
   size_t num_recent_ops = 0;
   size_t num_slow_ops = 0;
 };
@@ -235,7 +318,10 @@ class OperationThrottler : public BlockerT<OperationThrottler>,
     crimson::osd::scheduler::params_t params,
     F &&f) {
     return with_throttle(op, params, f).then([this, params, op, f](bool cont) {
-      return cont ? with_throttle_while(op, params, f) : seastar::now();
+      return cont
+	? seastar::yield().then([params, op, f, this] {
+	  return with_throttle_while(op, params, f); })
+	: seastar::now();
     });
   }
 
@@ -254,6 +340,18 @@ public:
     Args&&... args) {
     return trigger.maybe_record_blocking(
       with_throttle_while(std::forward<Args>(args)...), *this);
+  }
+
+  // Returns std::nullopt if the throttle is acquired immediately,
+  // returns the future for the acquiring otherwise
+  std::optional<seastar::future<>>
+  try_acquire_throttle_now(crimson::osd::scheduler::params_t params) {
+    if (!max_in_progress || in_progress < max_in_progress) {
+      ++in_progress;
+      --pending;
+      return std::nullopt;
+    }
+    return acquire_throttle(params);
   }
 
 private:

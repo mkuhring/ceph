@@ -39,7 +39,6 @@
 #endif
 
 #include <iosfwd>
-#include <iomanip>
 #include <list>
 #include <memory>
 #include <vector>
@@ -153,11 +152,11 @@ struct error_code;
 #ifdef HAVE_SEASTAR
   /// create a raw buffer to wrap seastar cpu-local memory, using foreign_ptr to
   /// make it safe to share between cpus
-  ceph::unique_leakable_ptr<buffer::raw> create_foreign(seastar::temporary_buffer<char>&& buf);
+  ceph::unique_leakable_ptr<buffer::raw> create(seastar::temporary_buffer<char>&& buf);
   /// create a raw buffer to wrap seastar cpu-local memory, without the safety
   /// of foreign_ptr. the caller must otherwise guarantee that the buffer ptr is
   /// destructed on this cpu
-  ceph::unique_leakable_ptr<buffer::raw> create(seastar::temporary_buffer<char>&& buf);
+  ceph::unique_leakable_ptr<buffer::raw> create_local(seastar::temporary_buffer<char>&& buf);
 #endif
 
   /*
@@ -700,6 +699,12 @@ struct error_code;
       void copy_shallow(unsigned len, ptr &dest);
       void copy(unsigned len, list &dest);
       void copy(unsigned len, std::string &dest);
+      template<typename A>
+      void copy(unsigned len, std::vector<uint8_t,A>& u8v) {
+        u8v.resize(len);
+        copy(len, (char*)u8v.data());
+      }
+
       void copy_all(list &dest);
 
       // get a pointer to the currenet iterator position, return the
@@ -1140,6 +1145,10 @@ struct error_code;
     void append(std::string_view s) {
       append(s.data(), s.length());
     }
+    template<typename A>
+    void append(const std::vector<uint8_t,A>& u8v) {
+      append((const char *)u8v.data(), u8v.size());
+    }
 #endif // __cplusplus >= 201703L
     void append(const ptr& bp);
     void append(ptr&& bp);
@@ -1284,6 +1293,23 @@ std::ostream& operator<<(std::ostream& out, const buffer::list& bl);
 inline bufferhash& operator<<(bufferhash& l, const bufferlist &r) {
   l.update(r);
   return l;
+}
+
+static inline
+void copy_bufferlist_to_iovec(const struct iovec *iov, unsigned iovcnt,
+                              bufferlist *bl, int64_t r)
+{
+  auto iter = bl->cbegin();
+  for (unsigned j = 0, resid = r; j < iovcnt && resid > 0; j++) {
+         /*
+          * This piece of code aims to handle the case that bufferlist
+          * does not have enough data to fill in the iov
+          */
+         const auto round_size = std::min<unsigned>(resid, iov[j].iov_len);
+         iter.copy(round_size, reinterpret_cast<char*>(iov[j].iov_base));
+         resid -= round_size;
+         /* iter is self-updating */
+  }
 }
 
 } // namespace buffer

@@ -16,6 +16,7 @@
  */
 
 #include <errno.h>
+#include <memory>
 #include <stdlib.h>
 
 #include "crush/CrushWrapper.h"
@@ -91,7 +92,7 @@ TEST(ErasureCodeLrc, parse_rule)
 
 TEST(ErasureCodeTest, create_rule)
 {
-  CrushWrapper *c = new CrushWrapper;
+  auto c = std::make_unique<CrushWrapper>();
   c->create();
   int root_type = 3;
   c->set_type_name(root_type, "root");
@@ -416,7 +417,7 @@ TEST(ErasureCodeLrc, layers_init)
     EXPECT_EQ(0, lrc.layers_init(&cerr));
     EXPECT_EQ("5", lrc.layers.front().profile["k"]);
     EXPECT_EQ("2", lrc.layers.front().profile["m"]);
-    EXPECT_EQ("jerasure", lrc.layers.front().profile["plugin"]);
+    EXPECT_EQ("isa", lrc.layers.front().profile["plugin"]);
     EXPECT_EQ("reed_sol_van", lrc.layers.front().profile["technique"]);
   }
 }

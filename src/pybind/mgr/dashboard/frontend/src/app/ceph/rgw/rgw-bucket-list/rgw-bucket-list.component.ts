@@ -1,7 +1,8 @@
-import { Component, NgZone, OnInit, TemplateRef, ViewChild } from '@angular/core';
+import { Component, NgZone, OnDestroy, OnInit, TemplateRef, ViewChild } from '@angular/core';
 
 import _ from 'lodash';
-import { forkJoin as observableForkJoin, Observable, Subscriber } from 'rxjs';
+import { forkJoin as observableForkJoin, Observable, Subscriber, Subscription } from 'rxjs';
+import { switchMap } from 'rxjs/operators';
 
 import { RgwBucketService } from '~/app/shared/api/rgw-bucket.service';
 import { ListWithDetails } from '~/app/shared/classes/list-with-details.class';
@@ -13,12 +14,15 @@ import { CdTableAction } from '~/app/shared/models/cd-table-action';
 import { CdTableColumn } from '~/app/shared/models/cd-table-column';
 import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data-context';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
+import { FinishedTask } from '~/app/shared/models/finished-task';
 import { Permission } from '~/app/shared/models/permissions';
 import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
 import { DimlessPipe } from '~/app/shared/pipes/dimless.pipe';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
-import { ModalService } from '~/app/shared/services/modal.service';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 import { URLBuilderService } from '~/app/shared/services/url-builder.service';
+import { Bucket } from '../models/rgw-bucket';
 
 const BASE_URL = 'rgw/bucket';
 
@@ -28,30 +32,34 @@ const BASE_URL = 'rgw/bucket';
   styleUrls: ['./rgw-bucket-list.component.scss'],
   providers: [{ provide: URLBuilderService, useValue: new URLBuilderService(BASE_URL) }]
 })
-export class RgwBucketListComponent extends ListWithDetails implements OnInit {
+export class RgwBucketListComponent extends ListWithDetails implements OnInit, OnDestroy {
   @ViewChild(TableComponent, { static: true })
   table: TableComponent;
   @ViewChild('bucketSizeTpl', { static: true })
   bucketSizeTpl: TemplateRef<any>;
   @ViewChild('bucketObjectTpl', { static: true })
   bucketObjectTpl: TemplateRef<any>;
+  @ViewChild('deleteTpl', { static: true })
+  deleteTpl: TemplateRef<any>;
 
   permission: Permission;
   tableActions: CdTableAction[];
   columns: CdTableColumn[] = [];
-  buckets: object[] = [];
+  buckets: Bucket[] = [];
   selection: CdTableSelection = new CdTableSelection();
-  staleTimeout: number;
+  declare staleTimeout: number;
+  private subs: Subscription = new Subscription();
 
   constructor(
     private authStorageService: AuthStorageService,
     private dimlessBinaryPipe: DimlessBinaryPipe,
     private dimlessPipe: DimlessPipe,
     private rgwBucketService: RgwBucketService,
-    private modalService: ModalService,
+    private modalService: ModalCdsService,
     private urlBuilder: URLBuilderService,
     public actionLabels: ActionLabelsI18n,
-    protected ngZone: NgZone
+    protected ngZone: NgZone,
+    private taskWrapper: TaskWrapperService
   ) {
     super(ngZone);
   }
@@ -92,6 +100,11 @@ export class RgwBucketListComponent extends ListWithDetails implements OnInit {
         prop: 'object_usage',
         cellTemplate: this.bucketObjectTpl,
         flexGrow: 0.8
+      },
+      {
+        name: $localize`Number of Shards`,
+        prop: 'num_shards',
+        flexGrow: 0.8
       }
     ];
     const getBucketUri = () =>
@@ -121,33 +134,18 @@ export class RgwBucketListComponent extends ListWithDetails implements OnInit {
     this.setTableRefreshTimeout();
   }
 
-  transformBucketData() {
-    _.forEach(this.buckets, (bucketKey) => {
-      const maxBucketSize = bucketKey['bucket_quota']['max_size'];
-      const maxBucketObjects = bucketKey['bucket_quota']['max_objects'];
-      bucketKey['bucket_size'] = 0;
-      bucketKey['num_objects'] = 0;
-      if (!_.isEmpty(bucketKey['usage'])) {
-        bucketKey['bucket_size'] = bucketKey['usage']['rgw.main']['size_actual'];
-        bucketKey['num_objects'] = bucketKey['usage']['rgw.main']['num_objects'];
-      }
-      bucketKey['size_usage'] =
-        maxBucketSize > 0 ? bucketKey['bucket_size'] / maxBucketSize : undefined;
-      bucketKey['object_usage'] =
-        maxBucketObjects > 0 ? bucketKey['num_objects'] / maxBucketObjects : undefined;
-    });
-  }
-
   getBucketList(context: CdTableFetchDataContext) {
     this.setTableRefreshTimeout();
-    this.rgwBucketService.list(true).subscribe(
-      (resp: object[]) => {
-        this.buckets = resp;
-        this.transformBucketData();
-      },
-      () => {
-        context.error();
-      }
+    this.subs.add(
+      this.rgwBucketService
+        .fetchAndTransformBuckets()
+        .pipe(switchMap(() => this.rgwBucketService.buckets$))
+        .subscribe({
+          next: (buckets) => {
+            this.buckets = buckets;
+          },
+          error: () => context.error()
+        })
     );
   }
 
@@ -156,33 +154,45 @@ export class RgwBucketListComponent extends ListWithDetails implements OnInit {
   }
 
   deleteAction() {
+    const itemNames = this.selection.selected.map((bucket: any) => bucket['bid']);
     this.modalService.show(CriticalConfirmationModalComponent, {
       itemDescription: this.selection.hasSingleSelection ? $localize`bucket` : $localize`buckets`,
-      itemNames: this.selection.selected.map((bucket: any) => bucket['bid']),
+      itemNames: itemNames,
+      bodyTemplate: this.deleteTpl,
       submitActionObservable: () => {
         return new Observable((observer: Subscriber<any>) => {
-          // Delete all selected data table rows.
-          observableForkJoin(
-            this.selection.selected.map((bucket: any) => {
-              return this.rgwBucketService.delete(bucket.bid);
+          this.taskWrapper
+            .wrapTaskAroundCall({
+              task: new FinishedTask('rgw/bucket/delete', {
+                bucket_names: itemNames
+              }),
+              call: observableForkJoin(
+                this.selection.selected.map((bucket: any) => {
+                  return this.rgwBucketService.delete(bucket.bid);
+                })
+              )
             })
-          ).subscribe({
-            error: (error) => {
-              // Forward the error to the observer.
-              observer.error(error);
-              // Reload the data table content because some deletions might
-              // have been executed successfully in the meanwhile.
-              this.table.refreshBtn();
-            },
-            complete: () => {
-              // Notify the observer that we are done.
-              observer.complete();
-              // Reload the data table content.
-              this.table.refreshBtn();
-            }
-          });
+            .subscribe({
+              error: (error: any) => {
+                // Forward the error to the observer.
+                observer.error(error);
+                // Reload the data table content because some deletions might
+                // have been executed successfully in the meanwhile.
+                this.table.refreshBtn();
+              },
+              complete: () => {
+                // Notify the observer that we are done.
+                observer.complete();
+                // Reload the data table content.
+                this.table.refreshBtn();
+              }
+            });
         });
       }
     });
+  }
+
+  ngOnDestroy() {
+    this.subs.unsubscribe();
   }
 }

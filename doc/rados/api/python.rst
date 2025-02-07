@@ -1,3 +1,5 @@
+.. _librados-python:
+
 ===================
  Librados (Python)
 ===================
@@ -69,7 +71,7 @@ Your Python client also requires a client keyring. For this example, we use the
 ``client.admin`` key by default. If you would like to specify the keyring when
 creating the cluster handle, you may use the ``conf`` argument. Alternatively,
 you may specify the keyring path in your Ceph configuration file. For example,
-you may add something like the following line to you Ceph configuration file::
+you may add something like the following line to your Ceph configuration file::
 
 	keyring = /path/to/ceph.client.admin.keyring
 
@@ -353,7 +355,7 @@ invoking methods of the `Ioctx` and other classes.
 .. --------------
 
 .. The Ceph Storage Cluster allows you to make a snapshot of a pool's state.
-.. Whereas, basic pool operations only require a connection to the cluster,
+.. Although basic pool operations require only a connection to the cluster,
 .. snapshots require an I/O context.
 
 .. Ioctx.create_snap(self, snap_name)

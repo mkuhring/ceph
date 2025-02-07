@@ -11,10 +11,11 @@
  * Foundation. See file COPYING.
  *
  */
-#include "rgw/rgw_rados.h"
-#include "rgw/rgw_http_client.h"
+#include "rgw_rados.h"
+#include "rgw_http_client.h"
 #include "global/global_init.h"
 #include "common/ceph_argparse.h"
+#include <unistd.h>
 #include <curl/curl.h>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
@@ -23,14 +24,43 @@
 
 using namespace std;
 
+namespace {
+  using tcp = boost::asio::ip::tcp;
+
+  // if we have a racing where another thread manages to bind and listen the
+  // port picked by this acceptor, try again.
+  static constexpr int MAX_BIND_RETRIES = 60;
+
+  tcp::acceptor try_bind(boost::asio::io_context& ioctx) {
+    using tcp = boost::asio::ip::tcp;
+    tcp::endpoint endpoint(tcp::v4(), 0);
+    tcp::acceptor acceptor(ioctx);
+    acceptor.open(endpoint.protocol());
+    for (int retries = 0;; retries++) {
+      try {
+	acceptor.bind(endpoint);
+	// yay!
+	break;
+      } catch (const boost::system::system_error& e) {
+	if (retries == MAX_BIND_RETRIES) {
+	  throw;
+	}
+	if (e.code() != boost::system::errc::address_in_use) {
+	  throw;
+	}
+      }
+      // backoff a little bit
+      sleep(1);
+    }
+    return acceptor;
+  }
+}
+
 TEST(HTTPManager, ReadTruncated)
 {
   using tcp = boost::asio::ip::tcp;
-  tcp::endpoint endpoint(tcp::v4(), 0);
   boost::asio::io_context ioctx;
-  tcp::acceptor acceptor(ioctx);
-  acceptor.open(endpoint.protocol());
-  acceptor.bind(endpoint);
+  auto acceptor = try_bind(ioctx);
   acceptor.listen();
 
   std::thread server{[&] {
@@ -46,7 +76,8 @@ TEST(HTTPManager, ReadTruncated)
   const auto url = std::string{"http://127.0.0.1:"} + std::to_string(acceptor.local_endpoint().port());
 
   RGWHTTPClient client{g_ceph_context, "GET", url};
-  EXPECT_EQ(-EAGAIN, RGWHTTP::process(&client, null_yield));
+  const auto dpp = NoDoutPrefix{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(-EAGAIN, RGWHTTP::process(&dpp, &client, null_yield));
 
   server.join();
 }
@@ -54,11 +85,8 @@ TEST(HTTPManager, ReadTruncated)
 TEST(HTTPManager, Head)
 {
   using tcp = boost::asio::ip::tcp;
-  tcp::endpoint endpoint(tcp::v4(), 0);
   boost::asio::io_context ioctx;
-  tcp::acceptor acceptor(ioctx);
-  acceptor.open(endpoint.protocol());
-  acceptor.bind(endpoint);
+  auto acceptor = try_bind(ioctx);
   acceptor.listen();
 
   std::thread server{[&] {
@@ -73,7 +101,8 @@ TEST(HTTPManager, Head)
   const auto url = std::string{"http://127.0.0.1:"} + std::to_string(acceptor.local_endpoint().port());
 
   RGWHTTPClient client{g_ceph_context, "HEAD", url};
-  EXPECT_EQ(0, RGWHTTP::process(&client, null_yield));
+  const auto dpp = NoDoutPrefix{g_ceph_context, ceph_subsys_rgw};
+  EXPECT_EQ(0, RGWHTTP::process(&dpp, &client, null_yield));
 
   server.join();
 }

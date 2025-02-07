@@ -115,11 +115,17 @@ def test_format_yaml(obj: Any, compatible: bool, yaml_val: str):
 
 
 class Retty:
-    def __init__(self, v) -> None:
+    def __init__(self, v, status="") -> None:
         self.value = v
+        self.status = status
 
     def mgr_return_value(self) -> int:
         return self.value
+
+    def mgr_status_value(self) -> str:
+        if self.status:
+            return self.status
+        return "NOPE"
 
 
 @pytest.mark.parametrize(
@@ -137,6 +143,24 @@ def test_return_value(obj: Any, ret: int):
     # a ReturnValueAdapter instance meets the ReturnValueProvider protocol.
     assert object_format._is_return_value_provider(rva)
     assert rva.mgr_return_value() == ret
+
+
+@pytest.mark.parametrize(
+    "obj, ret",
+    [
+        ({}, ""),
+        ({"fish": "sticks"}, ""),
+        (-55, ""),
+        (Retty(0), "NOPE"),
+        (Retty(-55, "cake"), "cake"),
+        (Retty(-50, "pie"), "pie"),
+    ],
+)
+def test_return_status(obj: Any, ret: str):
+    rva = object_format.StatusValueAdapter(obj)
+    # a StatusValueAdapter instance meets the StatusValueProvider protocol.
+    assert object_format._is_status_value_provider(rva)
+    assert rva.mgr_status_value() == ret
 
 
 def test_valid_formats():
@@ -263,12 +287,37 @@ class DecoDemo:
     def gamma_three(self, size: int = 0) -> Dict[str, Any]:
         return {"name": "funnystuff", "size": size}
 
+    @CLICommand("z_err", perm="rw")
+    @object_format.ErrorResponseHandler()
+    def z_err(self, name: str = "default") -> Tuple[int, str, str]:
+        if "z" in name:
+            raise object_format.ErrorResponse(f"{name} bad")
+        return 0, name, ""
+
+    @CLICommand("empty one", perm="rw")
+    @object_format.EmptyResponder()
+    def empty_one(self, name: str = "default", retval: Optional[int] = None) -> None:
+        # in real code, this would be making some sort of state change
+        # but we need to handle erors still
+        if retval is None:
+            retval = -5
+        if name in ["pow"]:
+            raise object_format.ErrorResponse(name, return_value=retval)
+        return
+
+    @CLICommand("empty bad", perm="rw")
+    @object_format.EmptyResponder()
+    def empty_bad(self, name: str = "default") -> int:
+        # in real code, this would be making some sort of state change
+        return 5
+
 
 @pytest.mark.parametrize(
-    "prefix, args, response",
+    "prefix, can_format, args, response",
     [
         (
             "alpha one",
+            True,
             {"name": "moonbase"},
             (
                 0,
@@ -279,6 +328,7 @@ class DecoDemo:
         # ---
         (
             "alpha one",
+            True,
             {"name": "moonbase2", "format": "yaml"},
             (
                 0,
@@ -289,6 +339,7 @@ class DecoDemo:
         # ---
         (
             "alpha one",
+            True,
             {"name": "moonbase2", "format": "chocolate"},
             (
                 -22,
@@ -299,6 +350,7 @@ class DecoDemo:
         # ---
         (
             "beta two",
+            True,
             {"name": "blocker"},
             (
                 0,
@@ -309,6 +361,7 @@ class DecoDemo:
         # ---
         (
             "beta two",
+            True,
             {"name": "test", "format": "yaml"},
             (
                 0,
@@ -319,6 +372,7 @@ class DecoDemo:
         # ---
         (
             "beta two",
+            True,
             {"name": "test", "format": "plain"},
             (
                 -22,
@@ -329,6 +383,7 @@ class DecoDemo:
         # ---
         (
             "gamma three",
+            True,
             {},
             (
                 0,
@@ -339,6 +394,7 @@ class DecoDemo:
         # ---
         (
             "gamma three",
+            True,
             {"size": 1, "format": "json"},
             (
                 0,
@@ -349,6 +405,7 @@ class DecoDemo:
         # ---
         (
             "gamma three",
+            True,
             {"size": 1, "format": "plain"},
             (
                 0,
@@ -359,6 +416,7 @@ class DecoDemo:
         # ---
         (
             "gamma three",
+            True,
             {"size": 2, "format": "plain"},
             (
                 0,
@@ -369,6 +427,7 @@ class DecoDemo:
         # ---
         (
             "gamma three",
+            True,
             {"size": 2, "format": "xml"},
             (
                 0,
@@ -379,6 +438,7 @@ class DecoDemo:
         # ---
         (
             "gamma three",
+            True,
             {"size": 2, "format": "toml"},
             (
                 -22,
@@ -386,11 +446,71 @@ class DecoDemo:
                 "Unknown format name: toml",
             ),
         ),
+        # ---
+        (
+            "z_err",
+            False,
+            {"name": "foobar"},
+            (
+                0,
+                "foobar",
+                "",
+            ),
+        ),
+        # ---
+        (
+            "z_err",
+            False,
+            {"name": "zamboni"},
+            (
+                -22,
+                "",
+                "zamboni bad",
+            ),
+        ),
+        # ---
+        (
+            "empty one",
+            False,
+            {"name": "zucchini"},
+            (
+                0,
+                "",
+                "",
+            ),
+        ),
+        # ---
+        (
+            "empty one",
+            False,
+            {"name": "pow"},
+            (
+                -5,
+                "",
+                "pow",
+            ),
+        ),
+        # Ensure setting return_value to zero even on an exception is honored
+        (
+            "empty one",
+            False,
+            {"name": "pow", "retval": 0},
+            (
+                0,
+                "",
+                "pow",
+            ),
+        ),
     ],
 )
-def test_cli_command_responder(prefix, args, response):
+def test_cli_with_decorators(prefix, can_format, args, response):
     dd = DecoDemo()
-    assert CLICommand.COMMANDS[prefix].call(dd, args, None) == response
+    cmd = CLICommand.COMMANDS[prefix]
+    assert cmd.call(dd, args, None) == response
+    # slighly hacky way to check that the CLI "knows" about a --format option
+    # checking the extra_args feature of the Decorators that provide them (Responder)
+    if can_format:
+        assert 'name=format,' in cmd.args
 
 
 def test_error_response():
@@ -420,3 +540,67 @@ def test_error_response():
     assert r[1] == ""
     assert "blat" in r[2]
     assert r[0] == e3.mgr_return_value()
+
+    # A custom exception type with an errno property
+
+    class MyCoolException(Exception):
+        def __init__(self, err_msg: str, errno: int = 0) -> None:
+            super().__init__(errno, err_msg)
+            self.errno = errno
+            self.err_msg = err_msg
+
+        def __str__(self) -> str:
+            return self.err_msg
+
+    e4 = object_format.ErrorResponse.wrap(MyCoolException("beep", -17))
+    r = e4.format_response()
+    assert r[0] == -17
+    assert r[1] == ""
+    assert r[2] == "beep"
+    assert e4.mgr_return_value() == -17
+
+    e5 = object_format.ErrorResponse.wrap(MyCoolException("ok, fine", 0))
+    r = e5.format_response()
+    assert r[0] == 0
+    assert r[1] == ""
+    assert r[2] == "ok, fine"
+
+    e5 = object_format.ErrorResponse.wrap(MyCoolException("no can do", 8))
+    r = e5.format_response()
+    assert r[0] == -8
+    assert r[1] == ""
+    assert r[2] == "no can do"
+
+    # A custom exception type that inherits from ErrorResponseBase
+
+    class MyErrorResponse(object_format.ErrorResponseBase):
+        def __init__(self, err_msg: str, return_value: int):
+            super().__init__(self, err_msg)
+            self.msg = err_msg
+            self.return_value = return_value
+
+        def format_response(self):
+            return self.return_value, "", self.msg
+
+
+    e6 = object_format.ErrorResponse.wrap(MyErrorResponse("yeah, sure", 0))
+    r = e6.format_response()
+    assert r[0] == 0
+    assert r[1] == ""
+    assert r[2] == "yeah, sure"
+    assert isinstance(e5, object_format.ErrorResponseBase)
+    assert isinstance(e6, MyErrorResponse)
+
+    e7 = object_format.ErrorResponse.wrap(MyErrorResponse("no can do", -8))
+    r = e7.format_response()
+    assert r[0] == -8
+    assert r[1] == ""
+    assert r[2] == "no can do"
+    assert isinstance(e7, object_format.ErrorResponseBase)
+    assert isinstance(e7, MyErrorResponse)
+
+
+def test_empty_responder_return_check():
+    dd = DecoDemo()
+    with pytest.raises(ValueError):
+        CLICommand.COMMANDS["empty bad"].call(dd, {}, None)

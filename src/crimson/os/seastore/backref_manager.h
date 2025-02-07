@@ -6,6 +6,7 @@
 #include "crimson/os/seastore/cache.h"
 #include "crimson/os/seastore/cached_extent.h"
 #include "crimson/os/seastore/transaction.h"
+#include "crimson/os/seastore/backref_mapping.h"
 
 namespace crimson::os::seastore {
 
@@ -42,7 +43,7 @@ public:
    */
   using get_mapping_iertr = base_iertr::extend<
     crimson::ct_error::enoent>;
-  using get_mapping_ret = get_mapping_iertr::future<BackrefPinRef>;
+  using get_mapping_ret = get_mapping_iertr::future<BackrefMappingRef>;
   virtual get_mapping_ret  get_mapping(
     Transaction &t,
     paddr_t offset) = 0;
@@ -62,7 +63,7 @@ public:
    * Insert new paddr_t -> laddr_t mapping
    */
   using new_mapping_iertr = base_iertr;
-  using new_mapping_ret = new_mapping_iertr::future<BackrefPinRef>;
+  using new_mapping_ret = new_mapping_iertr::future<BackrefMappingRef>;
   virtual new_mapping_ret new_mapping(
     Transaction &t,
     paddr_t key,
@@ -96,7 +97,10 @@ public:
     paddr_t start,
     paddr_t end) = 0;
 
-  virtual void cache_new_backref_extent(paddr_t paddr, extent_types_t type) = 0;
+  virtual void cache_new_backref_extent(
+    paddr_t paddr,
+    paddr_t key,
+    extent_types_t type) = 0;
 
   /**
    * merge in-cache paddr_t -> laddr_t mappings to the on-disk backref tree
@@ -132,21 +136,10 @@ public:
   using scan_mapped_space_iertr = base_iertr;
   using scan_mapped_space_ret = scan_mapped_space_iertr::future<>;
   using scan_mapped_space_func_t = std::function<
-    void(paddr_t, extent_len_t, extent_types_t, laddr_t)>;
+    void(paddr_t, paddr_t, extent_len_t, extent_types_t, laddr_t)>;
   virtual scan_mapped_space_ret scan_mapped_space(
     Transaction &t,
     scan_mapped_space_func_t &&f) = 0;
-
-  virtual void complete_transaction(
-    Transaction &t,
-    std::vector<CachedExtentRef> &to_clear,	///< extents whose pins are to be cleared,
-						//   as the results of their retirements
-    std::vector<CachedExtentRef> &to_link	///< fresh extents whose pins are to be inserted
-						//   into backref manager's pin set
-  ) = 0;
-
-  virtual void add_pin(BackrefPin &pin) = 0;
-  virtual void remove_pin(BackrefPin &pin) = 0;
 
   virtual ~BackrefManager() {}
 };

@@ -20,8 +20,11 @@ namespace {
 namespace crimson::os::seastore::segment_manager {
 
 std::ostream &operator<<(std::ostream &lhs, const ephemeral_config_t &c) {
-  return lhs << "ephemeral_config_t(size=" << c.size << ", block_size=" << c.block_size
-	     << ", segment_size=" << c.segment_size << ")";
+  return lhs << "ephemeral_config_t(size=0x"
+             << std::hex << c.size
+             << ", block_size=0x" << c.block_size
+             << ", segment_size=0x" << c.segment_size
+             << std::dec << ")";
 }
 
 EphemeralSegmentManagerRef create_test_ephemeral() {
@@ -30,11 +33,21 @@ EphemeralSegmentManagerRef create_test_ephemeral() {
 }
 
 device_config_t get_ephemeral_device_config(
-    std::size_t index, std::size_t num_devices)
+    std::size_t index,
+    std::size_t num_main_devices,
+    std::size_t num_cold_devices)
 {
+  auto num_devices = num_main_devices + num_cold_devices;
   assert(num_devices > index);
+  auto get_sec_dtype = [num_main_devices](std::size_t idx) {
+    if (idx < num_main_devices) {
+      return device_type_t::EPHEMERAL_MAIN;
+    } else {
+      return device_type_t::EPHEMERAL_COLD;
+    }
+  };
+
   magic_t magic = 0xabcd;
-  auto type = device_type_t::SEGMENTED;
   bool is_major_device;
   secondary_device_set_t secondary_devices;
   if (index == 0) {
@@ -44,7 +57,12 @@ device_config_t get_ephemeral_device_config(
          ++secondary_index) {
       device_id_t secondary_id = static_cast<device_id_t>(secondary_index);
       secondary_devices.insert({
-        secondary_index, device_spec_t{magic, type, secondary_id}
+        secondary_index,
+	device_spec_t{
+	  magic,
+	  get_sec_dtype(secondary_index),
+	  secondary_id
+	}
       });
     }
   } else { // index > 0
@@ -54,7 +72,11 @@ device_config_t get_ephemeral_device_config(
   device_id_t id = static_cast<device_id_t>(index);
   seastore_meta_t meta = {};
   return {is_major_device,
-          device_spec_t{magic, type, id},
+          device_spec_t{
+            magic,
+	    get_sec_dtype(index),
+            id
+          },
           meta,
           secondary_devices};
 }
@@ -63,7 +85,7 @@ EphemeralSegment::EphemeralSegment(
   EphemeralSegmentManager &manager, segment_id_t id)
   : manager(manager), id(id) {}
 
-seastore_off_t EphemeralSegment::get_write_capacity() const
+segment_off_t EphemeralSegment::get_write_capacity() const
 {
   return manager.get_segment_size();
 }
@@ -76,7 +98,7 @@ Segment::close_ertr::future<> EphemeralSegment::close()
 }
 
 Segment::write_ertr::future<> EphemeralSegment::write(
-  seastore_off_t offset, ceph::bufferlist bl)
+  segment_off_t offset, ceph::bufferlist bl)
 {
   if (offset < write_pointer || offset % manager.config.block_size != 0)
     return crimson::ct_error::invarg::make();
@@ -85,6 +107,12 @@ Segment::write_ertr::future<> EphemeralSegment::write(
     return crimson::ct_error::enospc::make();
 
   return manager.segment_write(paddr_t::make_seg_paddr(id, offset), bl);
+}
+
+Segment::write_ertr::future<> EphemeralSegment::advance_wp(
+  segment_off_t offset)
+{
+  return write_ertr::now();
 }
 
 Segment::close_ertr::future<> EphemeralSegmentManager::segment_close(segment_id_t id)
@@ -116,7 +144,8 @@ Segment::write_ertr::future<> EphemeralSegmentManager::segment_write(
 {
   auto& seg_addr = addr.as_seg_paddr();
   logger().debug(
-    "segment_write to segment {} at offset {}, physical offset {}, len {}, crc {}",
+    "segment_write to segment {} at offset 0x{:x}, "
+    "physical offset 0x{:x}, len 0x{:x}, crc 0x{:x}",
     seg_addr.get_segment_id(),
     seg_addr.get_segment_off(),
     get_offset(addr),
@@ -243,7 +272,7 @@ SegmentManager::read_ertr::future<> EphemeralSegmentManager::read(
 
   if (seg_addr.get_segment_off() + len > config.segment_size) {
     logger().error(
-      "EphemeralSegmentManager::read: invalid offset {}~{}!",
+      "EphemeralSegmentManager::read: invalid offset {}~0x{:x}!",
       addr,
       len);
     return crimson::ct_error::invarg::make();
@@ -254,7 +283,8 @@ SegmentManager::read_ertr::future<> EphemeralSegmentManager::read(
   bufferlist bl;
   bl.push_back(out);
   logger().debug(
-    "segment_read to segment {} at offset {}, physical offset {}, length {}, crc {}",
+    "segment_read to segment {} at offset 0x{:x}, "
+    "physical offset 0x{:x}, length 0x{:x}, crc 0x{:x}",
     seg_addr.get_segment_id().device_segment_id(),
     seg_addr.get_segment_off(),
     get_offset(addr),

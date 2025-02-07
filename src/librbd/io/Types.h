@@ -66,7 +66,6 @@ enum ImageDispatchLayer {
   IMAGE_DISPATCH_LAYER_JOURNAL,
   IMAGE_DISPATCH_LAYER_WRITE_BLOCK,
   IMAGE_DISPATCH_LAYER_WRITEBACK_CACHE,
-  IMAGE_DISPATCH_LAYER_CRYPTO,
   IMAGE_DISPATCH_LAYER_CORE,
   IMAGE_DISPATCH_LAYER_LAST
 };
@@ -95,6 +94,10 @@ enum {
   IMAGE_DISPATCH_FLAG_QOS_MASK                = (
     IMAGE_DISPATCH_FLAG_QOS_BPS_MASK |
     IMAGE_DISPATCH_FLAG_QOS_IOPS_MASK),
+
+  // TODO: pass area through ImageDispatchInterface and remove
+  // this flag
+  IMAGE_DISPATCH_FLAG_CRYPTO_HEADER           = 1 << 6
 };
 
 enum {
@@ -110,11 +113,6 @@ enum {
     RBD_IO_OPERATION_DISCARD |
     RBD_IO_OPERATION_WRITE_SAME |
     RBD_IO_OPERATION_COMPARE_AND_WRITE)
-};
-
-enum ImageExtentsMapType {
-    IMAGE_EXTENTS_MAP_TYPE_LOGICAL_TO_PHYSICAL,
-    IMAGE_EXTENTS_MAP_TYPE_PHYSICAL_TO_LOGICAL,
 };
 
 enum ObjectDispatchLayer {
@@ -181,8 +179,9 @@ struct SparseExtent {
 std::ostream& operator<<(std::ostream& os, const SparseExtent& state);
 
 struct SparseExtentSplitMerge {
-  SparseExtent split(uint64_t offset, uint64_t length, SparseExtent &se) const {
-    return SparseExtent(se.state, se.length);
+  SparseExtent split(uint64_t offset, uint64_t length,
+                     const SparseExtent& se) const {
+    return SparseExtent(se.state, length);
   }
 
   bool can_merge(const SparseExtent& left, const SparseExtent& right) const {
@@ -233,10 +232,10 @@ struct SparseBufferlistExtent : public SparseExtent {
 
 struct SparseBufferlistExtentSplitMerge {
   SparseBufferlistExtent split(uint64_t offset, uint64_t length,
-                               SparseBufferlistExtent& sbe) const {
+                               const SparseBufferlistExtent& sbe) const {
     ceph::bufferlist bl;
     if (sbe.state == SPARSE_EXTENT_STATE_DATA) {
-      bl.substr_of(bl, offset, length);
+      bl.substr_of(sbe.bl, offset, length);
     }
     return SparseBufferlistExtent(sbe.state, length, std::move(bl));
   }
@@ -248,14 +247,13 @@ struct SparseBufferlistExtentSplitMerge {
 
   SparseBufferlistExtent merge(SparseBufferlistExtent&& left,
                                SparseBufferlistExtent&& right) const {
+    ceph::bufferlist bl;
     if (left.state == SPARSE_EXTENT_STATE_DATA) {
-      ceph::bufferlist bl{std::move(left.bl)};
-      bl.claim_append(std::move(right.bl));
-      return SparseBufferlistExtent(SPARSE_EXTENT_STATE_DATA,
-                                    bl.length(), std::move(bl));
-    } else {
-      return SparseBufferlistExtent(left.state, left.length + right.length, {});
+      bl.claim_append(left.bl);
+      bl.claim_append(right.bl);
     }
+    return SparseBufferlistExtent(left.state, left.length + right.length,
+                                  std::move(bl));
   }
 
   uint64_t length(const SparseBufferlistExtent& sbe) const {
@@ -274,6 +272,13 @@ using striper::LightweightObjectExtents;
 
 typedef std::pair<uint64_t,uint64_t> Extent;
 typedef std::vector<Extent> Extents;
+
+enum class ImageArea {
+  DATA,
+  CRYPTO_HEADER
+};
+
+std::ostream& operator<<(std::ostream& os, ImageArea area);
 
 struct ReadExtent {
     const uint64_t offset;

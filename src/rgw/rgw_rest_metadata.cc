@@ -56,7 +56,7 @@ void RGWOp_Metadata_Get::execute(optional_yield y) {
 
   frame_metadata_key(s, metadata_key);
 
-  auto meta_mgr = static_cast<rgw::sal::RadosStore*>(store)->ctl()->meta.mgr;
+  auto meta_mgr = static_cast<rgw::sal::RadosStore*>(driver)->ctl()->meta.mgr;
 
   /* Get keys */
   op_ret = meta_mgr->get(metadata_key, s->formatter, s->yield, s);
@@ -69,10 +69,7 @@ void RGWOp_Metadata_Get::execute(optional_yield y) {
 }
 
 void RGWOp_Metadata_Get_Myself::execute(optional_yield y) {
-  string owner_id;
-
-  owner_id = s->owner.get_id().to_str();
-  s->info.args.append("key", owner_id);
+  s->info.args.append("key", to_string(s->owner.id));
 
   return RGWOp_Metadata_Get::execute(y);
 }
@@ -125,7 +122,7 @@ void RGWOp_Metadata_List::execute(optional_yield y) {
      marker = "3:bf885d8f:root::sorry_janefonda_665:head";
   */
 
-  op_ret = store->meta_list_keys_init(this, metadata_key, marker, &handle);
+  op_ret = driver->meta_list_keys_init(this, metadata_key, marker, &handle);
   if (op_ret < 0) {
     ldpp_dout(this, 5) << "ERROR: can't get key: " << cpp_strerror(op_ret) << dendl;
     return;
@@ -144,7 +141,7 @@ void RGWOp_Metadata_List::execute(optional_yield y) {
   do {
     list<string> keys;
     left = (max_entries_specified ? max_entries - count : max);
-    op_ret = store->meta_list_keys_next(this, handle, left, keys, &truncated);
+    op_ret = driver->meta_list_keys_next(this, handle, left, keys, &truncated);
     if (op_ret < 0) {
       ldpp_dout(this, 5) << "ERROR: lists_keys_next(): " << cpp_strerror(op_ret)
 	      << dendl;
@@ -166,12 +163,12 @@ void RGWOp_Metadata_List::execute(optional_yield y) {
     encode_json("count", count, s->formatter);
     if (truncated) {
       string esc_marker =
-	rgw::to_base64(store->meta_get_marker(handle));
+	rgw::to_base64(driver->meta_get_marker(handle));
       encode_json("marker", esc_marker, s->formatter);
     }
     s->formatter->close_section();
   }
-  store->meta_list_keys_complete(handle);
+  driver->meta_list_keys_complete(handle);
 
   op_ret = 0;
 }
@@ -263,7 +260,7 @@ void RGWOp_Metadata_Put::execute(optional_yield y) {
     }
   }
 
-  op_ret = static_cast<rgw::sal::RadosStore*>(store)->ctl()->meta.mgr->put(metadata_key, bl, s->yield, s, sync_type,
+  op_ret = static_cast<rgw::sal::RadosStore*>(driver)->ctl()->meta.mgr->put(metadata_key, bl, s->yield, s, sync_type,
 				       false, &ondisk_version);
   if (op_ret < 0) {
     ldpp_dout(s, 5) << "ERROR: can't put key: " << cpp_strerror(op_ret) << dendl;
@@ -294,7 +291,7 @@ void RGWOp_Metadata_Delete::execute(optional_yield y) {
   string metadata_key;
 
   frame_metadata_key(s, metadata_key);
-  op_ret = static_cast<rgw::sal::RadosStore*>(store)->ctl()->meta.mgr->remove(metadata_key, s->yield, s);
+  op_ret = static_cast<rgw::sal::RadosStore*>(driver)->ctl()->meta.mgr->remove(metadata_key, s->yield, s);
   if (op_ret < 0) {
     ldpp_dout(s, 5) << "ERROR: can't remove key: " << cpp_strerror(op_ret) << dendl;
     return;

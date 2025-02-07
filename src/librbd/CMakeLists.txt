@@ -58,7 +58,6 @@ set(librbd_internal_srcs
   cache/WriteAroundObjectDispatch.cc
   crypto/BlockCrypto.cc
   crypto/CryptoContextPool.cc
-  crypto/CryptoImageDispatch.cc
   crypto/CryptoObjectDispatch.cc
   crypto/FormatRequest.cc
   crypto/LoadRequest.cc
@@ -78,6 +77,7 @@ set(librbd_internal_srcs
   exclusive_lock/PostAcquireRequest.cc
   exclusive_lock/PreReleaseRequest.cc
   exclusive_lock/StandardPolicy.cc
+  group/ListSnapshotsRequest.cc
   image/AttachChildRequest.cc
   image/AttachParentRequest.cc
   image/CloneRequest.cc
@@ -212,10 +212,17 @@ endif()
 
 if(LINUX AND HAVE_LIBCRYPTSETUP)
   list(APPEND librbd_internal_srcs
-          crypto/luks/EncryptionFormat.cc
-          crypto/luks/Header.cc
+          crypto/luks/LUKSEncryptionFormat.cc
           crypto/luks/FormatRequest.cc
-          crypto/luks/LoadRequest.cc)
+          crypto/luks/FlattenRequest.cc
+          crypto/luks/Header.cc
+          crypto/luks/LoadRequest.cc
+          crypto/luks/Magic.cc)
+endif()
+
+if(HAVE_LIBNBD)
+  list(APPEND librbd_internal_srcs
+          migration/NBDStream.cc)
 endif()
 
 add_library(rbd_api STATIC librbd.cc)
@@ -238,6 +245,10 @@ target_include_directories(rbd_internal PRIVATE ${OPENSSL_INCLUDE_DIR})
 if(LINUX AND HAVE_LIBCRYPTSETUP)
   target_include_directories(rbd_internal PRIVATE ${LIBCRYPTSETUP_INCLUDE_DIR})
   target_link_libraries(rbd_internal PRIVATE ${LIBCRYPTSETUP_LIBRARIES})
+endif()
+if(HAVE_LIBNBD)
+  target_include_directories(rbd_internal PRIVATE ${LIBNBD_INCLUDE_DIR})
+  target_link_libraries(rbd_internal PRIVATE ${LIBNBD_LIBRARIES})
 endif()
 
 add_custom_target(librbd_plugins)
@@ -344,7 +355,7 @@ endif()
 if(ENABLE_SHARED)
   set_target_properties(librbd PROPERTIES
     OUTPUT_NAME rbd
-    VERSION 1.17.0
+    VERSION 1.19.0
     SOVERSION 1
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON)
